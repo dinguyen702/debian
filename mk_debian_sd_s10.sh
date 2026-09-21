@@ -33,6 +33,7 @@
 #   - sudo
 #   - curl  
 #   - git
+#   - openssl
 #
 # This script uses guestfs tools to create an SD card image.
 # For the tools to work efficiently, it is
@@ -85,7 +86,8 @@ declare -r DEBIAN_ARM64_URL="https://cloud.debian.org/images/cloud/trixie/202606
 declare -r DEBIAN_ARMHF_ARCHIVE="debian-13-armhf-rootfs-20260921.tar.xz"
 declare -r DEBIAN_ARMHF_URL="https://images.linuxcontainers.org/images/debian/trixie/armhf/default/20260921_05%3A24/rootfs.tar.xz"
 
-# file below enables the account 'root'
+# Created from DEBIAN_PASS when missing, then copied over the image's /etc/shadow
+# so the root account can log in.
 declare -r DEBIAN_SHADOW_FILE="etc/shadow"
 # the default fstab file provided with the nocloud image includes
 # PARTUUID's that are not relevant. The file below replaces it
@@ -327,6 +329,29 @@ function select_platform() {
     TOOLCHAIN_PREFIX="${TOOLCHAIN_DIR}-"
     LINUX_DTB_NAME="$(basename "${LINUX_DTB}")"
     SPL_ARTIFACT_NAME="$(basename "${SPL_ARTIFACT}")"
+
+    return 0
+}
+
+# Write etc/shadow with a usable root password when the file is not already present.
+function write_root_shadow() {
+
+    local hash
+    local days
+
+    if [[ -f ${_DEBIAN_SHADOW_FILE} ]]; then
+        return 0
+    fi
+
+    if ! hash=$(openssl passwd -6 "${DEBIAN_PASS}"); then
+        echo "error: failed to hash the root password" >&2
+        return 1
+    fi
+
+    days=$(( $(date +%s) / 86400 ))
+    mkdir -p "$(dirname "${_DEBIAN_SHADOW_FILE}")"
+    printf 'root:%s:%s:0:99999:7:::\n' "${hash}" "${days}" > "${_DEBIAN_SHADOW_FILE}"
+    chmod 0640 "${_DEBIAN_SHADOW_FILE}"
 
     return 0
 }
@@ -799,6 +824,10 @@ echo "Debian download complete"
 ## =============================================================================
 #
 echo "[STEP] Creating SD card image..."
+
+if ! write_root_shadow ; then
+    exit 1
+fi
 
 # Running guestfish requires access to /boot/vmlinuz-* (chmod a+r)
 # Being part of the kvm group may help with speed execution
