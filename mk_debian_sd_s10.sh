@@ -12,7 +12,7 @@
 #   ./mk_debian_sd_s10.sh [-p agilex5|agilex3|stratix10|arria10] [-c debconf.sh]
 #
 # OUTPUT:
-#   sdcard.img - Ready to write to SD card
+#   sdcard_<platform>.img - Ready to write to SD card
 #
 # REQUIREMENTS:
 # - Linux host system (Ubuntu 22.04+ recommended)
@@ -104,7 +104,7 @@ declare -r SZ_MB=$((${SZ_KB}*${SZ_KB}))
 declare -r SZ_GB=$((${SZ_MB}*${SZ_KB}))
 
 # sizes in bytes
-declare -r SDIMG=sdcard.img
+# SDIMG is set after the platform is chosen: sdcard_<platform>.img
 declare -r SDCARD_IMG_SIZE=$((4*SZ_GB))
 declare -r RFS_PART_SIZE=$((3*${SZ_GB}))
 declare -r BOOT_PART_SIZE=$((50*${SZ_MB}))
@@ -435,6 +435,8 @@ fi
 if ! select_platform "${PLATFORM}" ; then
     exit 1
 fi
+
+SDIMG="sdcard_${PLATFORM}.img"
 
 echo "======================================================================"
 echo "   ${PLATFORM_TITLE} HPS SD Card Boot Flow Builder"
@@ -857,7 +859,7 @@ if [[ $? -eq 0 ]]; then
     echo "Output files created in: ${PWD}"
     echo ""
     echo "Key files:"
-    echo "  sdcard.img                   - SD card image (write to SD card)"
+    echo "  ${SDIMG}                   - SD card image (write to SD card)"
     echo "  ${UBOOT_BIN}                   - U-Boot bootloader"
     echo "  Image                        - Linux kernel"
     echo "  ${LINUX_DTB_NAME}    - Device tree"
