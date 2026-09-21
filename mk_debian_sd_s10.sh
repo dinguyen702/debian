@@ -137,8 +137,8 @@ Builds an SD card image with an unmodified Debian run time.
 Usage: ${SELF} [-h] [-p <platform>] [-c <file>]
     -h: prints this message
     -p: SoCFPGA platform. One of: ${SUPPORTED_PLATFORMS}
-        Default is stratix10. A PLATFORM= value in the configuration file
-        is used when -p is not given.
+        When -p is omitted, a menu is shown. Pressing Enter keeps the
+        default (PLATFORM= from the configuration file, or stratix10).
     -c: specifies a configuration file to use.
 
 Platforms
@@ -331,6 +331,49 @@ function select_platform() {
     return 0
 }
 
+# Prompt for a platform. Sets PLATFORM. A bare Enter keeps the default.
+function choose_platform() {
+
+    local default="${1}"
+    local -a platforms
+    local -a titles
+    local choice
+    local i
+    local plat
+
+    read -r -a platforms <<< "${SUPPORTED_PLATFORMS}"
+    titles=(
+        "Agilex 5 SoC Development Kit"
+        "Agilex 3 SoC Development Kit"
+        "Stratix 10 SoC Development Kit"
+        "Arria 10 SoC Development Kit"
+    )
+
+    echo "Select a platform:"
+    for i in "${!platforms[@]}"; do
+        printf "  %d) %-12s %s\n" "$((i + 1))" "${platforms[i]}" "${titles[i]}"
+    done
+
+    while true; do
+        read -r -p "Choice [${default}]: " choice
+        if [[ -z ${choice} ]]; then
+            PLATFORM="${default}"
+            return 0
+        fi
+        if [[ ${choice} =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#platforms[@]} )); then
+            PLATFORM="${platforms[choice - 1]}"
+            return 0
+        fi
+        for plat in "${platforms[@]}"; do
+            if [[ ${choice} == "${plat}" ]]; then
+                PLATFORM="${plat}"
+                return 0
+            fi
+        done
+        echo "Enter a number from 1 to ${#platforms[@]}, or one of: ${SUPPORTED_PLATFORMS}" >&2
+    done
+}
+
 # =============================================================================
 # CLI 
 # =============================================================================
@@ -379,8 +422,15 @@ if ! check_config ; then
     exit 127
 fi
 
-# -p overrides PLATFORM from the configuration file. Default is stratix10.
-PLATFORM="${PLATFORM_ARG:-${PLATFORM:-stratix10}}"
+# -p skips the menu. Otherwise ask, unless this is not a terminal.
+if [[ -n ${PLATFORM_ARG} ]]; then
+    PLATFORM="${PLATFORM_ARG}"
+elif [[ -t 0 ]]; then
+    choose_platform "${PLATFORM:-stratix10}"
+else
+    PLATFORM="${PLATFORM:-stratix10}"
+    echo "No terminal; using platform ${PLATFORM}"
+fi
 
 if ! select_platform "${PLATFORM}" ; then
     exit 1
