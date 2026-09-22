@@ -855,6 +855,7 @@ upload ${_DEBIAN_SHADOW_FILE} /etc/shadow
 chmod 0640 /etc/shadow
 upload ${_DEBIAN_FSTAB_FILE} /etc/fstab
 tar-in ${_LINUX_LM_TAR} /
+ln-sf sbin/init /init
 sync
 EOF
 else
@@ -879,6 +880,7 @@ upload ${_DEBIAN_SHADOW_FILE} /etc/shadow
 chmod 0640 /etc/shadow
 upload ${_DEBIAN_FSTAB_FILE} /etc/fstab
 tar-in ${_LINUX_LM_TAR} /
+ln-sf sbin/init /init
 sync
 EOF
 fi
