@@ -667,7 +667,12 @@ make -j "${JOBS}" modules_install INSTALL_MOD_PATH="${_LINUX_LM_DIR_ABS}"
 set -x
 pwd
 cd ${_LINUX_LM_DIR_ABS}
-tar cf ${_LINUX_LM_TAR} lib/
+# Debian merges /lib into /usr/lib. A tarball rooted at lib/ replaces that
+# symlink, which removes /lib/systemd. Place modules under usr/lib instead.
+mkdir -p usr
+rm -rf usr/lib
+mv lib usr/lib
+tar cf ${_LINUX_LM_TAR} usr/lib/modules
 
 cd ..
 
