@@ -3,8 +3,8 @@ ATF_REPO="https://github.com/altera-fpga/arm-trusted-firmware.git"
 ATF_REF="socfpga_v2.14.1"
 UBOOT_REPO="https://github.com/altera-fpga/u-boot-socfpga.git"
 UBOOT_REF="socfpga_v2026.04"
-LINUX_REPO="git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
-LINUX_REF="v7.2"
+LINUX_REPO="https://github.com/altera-fpga/linux-socfpga.git"
+LINUX_REF="socfpga-6.18.20-lts"
 
 # optional
 UBOOT_ITS_FILE="uboot_script.its"
