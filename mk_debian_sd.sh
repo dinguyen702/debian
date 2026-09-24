@@ -109,7 +109,7 @@ declare -r SZ_GB=$((${SZ_MB}*${SZ_KB}))
 # SDIMG is set after the platform is chosen: sdcard_<platform>.img
 declare -r SDCARD_IMG_SIZE=$((4*SZ_GB))
 declare -r RFS_PART_SIZE=$((3*${SZ_GB}))
-declare -r BOOT_PART_SIZE=$((50*${SZ_MB}))
+declare -r BOOT_PART_SIZE=$((200*${SZ_MB}))
 
 # =============================================================================
 # HELPERS AND FUNCTIONS
