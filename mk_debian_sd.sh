@@ -130,6 +130,7 @@ declare -r SELF="$(basename $0)"
 # Supported -p values. agilex3 reuses the Agilex 5 TF-A platform: socfpga_v2.14.1
 # has no separate agilex3 port. Arria 10 is a Cortex-A9 and does not use TF-A.
 declare -r SUPPORTED_PLATFORMS="agilex5 agilex3 stratix10 arria10"
+declare -r DEF_PLATFORM="agilex5"
 
 function usage() {
 
@@ -140,7 +141,7 @@ Usage: ${SELF} [-h] [-p <platform>] [-c <file>]
     -h: prints this message
     -p: SoCFPGA platform. One of: ${SUPPORTED_PLATFORMS}
         When -p is omitted, a menu is shown. Pressing Enter keeps the
-        default (PLATFORM= from the configuration file, or stratix10).
+        default (PLATFORM= from the configuration file, or ${DEF_PLATFORM}).
     -c: specifies a configuration file to use.
 
 Platforms
@@ -451,9 +452,9 @@ fi
 if [[ -n ${PLATFORM_ARG} ]]; then
     PLATFORM="${PLATFORM_ARG}"
 elif [[ -t 0 ]]; then
-    choose_platform "${PLATFORM:-stratix10}"
+    choose_platform "${PLATFORM:-${DEF_PLATFORM}}"
 else
-    PLATFORM="${PLATFORM:-stratix10}"
+    PLATFORM="${PLATFORM:-${DEF_PLATFORM}}"
     echo "No terminal; using platform ${PLATFORM}"
 fi
 
