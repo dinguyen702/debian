@@ -653,52 +653,57 @@ ln-sf sbin/init /init
 sync
 EOF
 
-if [[ $? -eq 0 ]]; then
-    echo "SUCCESS: SD card image created: ${SDIMG}"
-    echo ""
-    echo "======================================================================"
-    echo "                           BUILD COMPLETE"
-    echo "======================================================================"
-    echo ""
-    echo "Output files created in: ${PWD}"
-    echo ""
-    echo "Key files:"
-    echo "  ${SDIMG}                   - SD card image (write to SD card)"
-    echo "  u-boot.itb                   - U-Boot bootloader"
-    echo "  Image                        - Linux kernel"
-    echo "  ${LINUX_DTB_NAME}    - Device tree"
-    echo "  ${DEBIAN_ARCHIVE}            - Debian root filesystem (downloaded)"
-    echo ""
-    echo "To write SD card image (:"
-    echo "  sudo dd if=${PWD}/${SDIMG} of=/dev/sdX bs=1M"
-    echo "  (Replace /dev/sdX with your SD card device)"
-    echo ""
-    echo "To boot from SD card:"
-    echo "  1. Write image to SD card"
-    echo "  2. Insert SD card into the Agilex 5 board"
-    echo "  3. Use quartus_pfg to generate a JIC using GHRD sof + u-boot-spl-dtb.hex"
-    echo "     e.g. quartus_pfg \\"
-    echo "          -c sof_filename.sof output_file.jic \\"
-    echo "          -o device=MT25QU128 \\"
-    echo "          -o flash_loader=A5ED065BB32AE6SR0 \\"
-    echo "          -o hps_path=${OUTPUT_DIR_ABS}/u-boot-spl-dtb.hex \\"
-    echo "          -o mode=ASX4 \\"
-    echo "          -o hps=1"
-    echo "  4. Program the JIC and power cycle the board"
-    echo "     e.g. quartus_pgm -c 1 -m jtag -o \"pvi;output_file.jic\""
-    echo ""
-    echo "To Login, user name is ${DEBIAN_USER} and the password is ${DEBIAN_PASS}"
-    echo ""
-    echo "IMPORTANT:"
-    echo " Once you have logged on to Debian on Agilex 5, please check the date"
-    echo " are set correctly by NTP"
-    echo "    timedatectl show"
-    echo " If NTPSynchronized=no appears, NTP is not functional, which may be"
-    echo " due to a firewall issue"
-    echo " You may have to set the date manually, such as:"
-    echo "    date -s '2026-06-22 12:00:00'"
-    echo ""
-else
+if [[ $? -ne 0 ]]; then
     echo "ERROR: Failed to create SD card image"
     exit 1
 fi
+
+cat <<EOS
+
+======================================================================
+                           BUILD COMPLETE
+======================================================================
+
+SD card image:  ${PWD}/${SDIMG}
+
+Build outputs (in ${PWD}):
+  ${SDIMG}
+      SD card image
+  ${UBOOT_DIR}/u-boot.itb
+      U-Boot bootloader
+  kernel.itb
+      Linux kernel and device tree (FIT image)
+  boot.scr.uimg
+      U-Boot boot script
+  u-boot-spl-dtb.hex
+      SPL image used to build the JIC
+  ${DEBIAN_ARCHIVE}
+      Debian root filesystem (downloaded)
+
+Write the SD card image (replace /dev/sdX with your SD card device):
+  sudo dd if=${PWD}/${SDIMG} of=/dev/sdX bs=1M status=progress conv=fsync
+
+Boot from the SD card:
+  1. Write the image to the SD card.
+  2. Insert the SD card into the Agilex 5 board.
+  3. Generate a JIC from the GHRD .sof and u-boot-spl-dtb.hex:
+       quartus_pfg -c sof_filename.sof output_file.jic \\
+           -o device=MT25QU128 \\
+           -o flash_loader=A5ED065BB32AE6SR0 \\
+           -o hps_path=${OUTPUT_DIR_ABS}/u-boot-spl-dtb.hex \\
+           -o mode=ASX4 \\
+           -o hps=1
+  4. Program the JIC and power cycle the board:
+       quartus_pgm -c 1 -m jtag -o "pvi;output_file.jic"
+
+Login:
+  user:     ${DEBIAN_USER}
+  password: ${DEBIAN_PASS}
+
+After logging in, check that NTP has set the clock:
+  timedatectl show
+If it reports NTPSynchronized=no, NTP is not working (often a firewall
+issue). Set the date manually, for example:
+  date -s '2026-06-22 12:00:00'
+
+EOS
