@@ -653,13 +653,13 @@ rm -f "${SDIMG}"
 truncate -s ${SDCARD_IMG_SIZE} "${SDIMG}"
 sfdisk --quiet "${SDIMG}" <<EOF
 label: dos
-start=${BOOT_PART_SECTOR_START}, size=${BOOT_PART_SECTORS}, type=c
+start=${BOOT_PART_SECTOR_START}, size=${BOOT_PART_SECTORS}, type=83
 start=${RFS_PART_SECTOR_START}, size=${RFS_PART_SECTORS}, type=83
 EOF
 
-# Boot partition
+# Boot partition, formatted as if created on the partition itself
 rm -f "${BOOT_IMG}"
-mkfs.vfat -C "${BOOT_IMG}" $(( ${BOOT_PART_SECTORS} / 2 )) >/dev/null
+mkfs.vfat -h ${BOOT_PART_SECTOR_START} -C "${BOOT_IMG}" $(( ${BOOT_PART_SECTORS} / 2 )) >/dev/null
 MTOOLS_SKIP_CHECK=1 mcopy -i "${BOOT_IMG}" "${UBOOT_DIR}/u-boot.itb" kernel.itb boot.scr.uimg ::/
 
 # Root file system, extracted from the first partition of disk.raw
@@ -702,7 +702,7 @@ fi
 
 # Assemble the SD card image
 dd if="${BOOT_IMG}" of="${SDIMG}" bs=4M oflag=seek_bytes \
-   seek=$(( ${BOOT_PART_SECTOR_START} * 512 )) conv=notrunc,sparse status=none
+   seek=$(( ${BOOT_PART_SECTOR_START} * 512 )) conv=notrunc status=none
 dd if="${RFS_IMG}" of="${SDIMG}" bs=4M oflag=seek_bytes \
    seek=$(( ${RFS_PART_SECTOR_START} * 512 )) conv=notrunc,sparse status=none
 
