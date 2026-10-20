@@ -22,7 +22,7 @@
 #   - build-essential
 #   - bison
 #   - flex
-#   - guestfs-tools for SD image creation
+#   - fdisk (sfdisk), dosfstools, mtools and e2fsprogs for SD image creation
 #   - u-boot-tools
 #   - python3-setuptools
 #   - python3-dev
@@ -30,15 +30,12 @@
 #   - bc 
 #   - xz-utils
 #   - swig
-#   - sudo
 #   - curl  
 #   - git
 #   - openssl
 #
-# This script uses guestfs tools to create an SD card image.
-# For the tools to work efficiently, it is
-# important the kernel image file in the host's /boot be readable by all users
-# and that the user running the script be part of the group 'kvm'.
+# The SD card image is assembled from regular files, so no root privileges
+# are needed to run this script.
 #
 # =============================================================================
 
@@ -256,6 +253,32 @@ function write_root_shadow() {
     return 0
 }
 
+# rootfs_has <ext4 image> <path>: succeeds when <path> exists in the image
+function rootfs_has() {
+
+    debugfs -R "stat \"${2}\"" "${1}" 2>/dev/null | grep -q '^Inode:'
+}
+
+# rootfs_tree_cmds <host dir> <image dir>: prints the debugfs commands that
+# copy the content of <host dir> into the existing <image dir>
+function rootfs_tree_cmds() {
+
+    local src="${1}"
+    local dst="${2}"
+    local type
+    local path
+
+    (cd "${src}" && find . -mindepth 1 -printf '%y %P\n') | while read -r type path ; do
+        case "${type}" in
+            d) echo "mkdir \"${dst}/${path}\"" ;;
+            f) echo "write \"${src}/${path}\" \"${dst}/${path}\"" ;;
+            l) echo "symlink \"${dst}/${path}\" \"$(readlink "${src}/${path}")\"" ;;
+            *) echo "${FUNCNAME}: error: unsupported file type: ${src}/${path}" >&2
+               return 1 ;;
+        esac
+    done
+}
+
 # =============================================================================
 # CLI 
 # =============================================================================
@@ -446,7 +469,6 @@ echo "[STEP] Building Linux kernel..."
 
 rm -rf ${LINUX_LM_DIR} && mkdir ${LINUX_LM_DIR}
 _LINUX_LM_DIR_ABS="$(readlink -f ${LINUX_LM_DIR})"
-_LINUX_LM_TAR="${PWD}/linux-modules.tar"
 
 if [[ ! -d "${LINUX_DIR}" ]]; then
     clone_and_checkout "${LINUX_REPO}" "${LINUX_REF}" "${LINUX_DIR}"
@@ -467,15 +489,6 @@ make oldconfig
 make -j "${JOBS}" Image && make "${LINUX_DTB}"
 make -j "${JOBS}" modules 
 make -j "${JOBS}" modules_install INSTALL_MOD_PATH="${_LINUX_LM_DIR_ABS}"
-set -x
-pwd
-cd ${_LINUX_LM_DIR_ABS}
-# Debian merges /lib into /usr/lib. A tarball rooted at lib/ replaces that
-# symlink, which removes /lib/systemd. Place modules under usr/lib instead.
-mkdir -p usr
-rm -rf usr/lib
-mv lib usr/lib
-tar cf ${_LINUX_LM_TAR} usr/lib/modules
 
 cd ..
 
@@ -629,34 +642,71 @@ if ! write_root_shadow ; then
     exit 1
 fi
 
-# Running guestfish requires access to /boot/vmlinuz-* (chmod a+r)
-# Being part of the kvm group may help with speed execution
-guestfish --ro -a disk.raw <<EOF
-sparse ${SDIMG} ${SDCARD_IMG_SIZE}
-run
-part-init /dev/sdb mbr
-part-add /dev/sdb p ${BOOT_PART_SECTOR_START} ${BOOT_PART_SECTOR_END}
-part-add /dev/sdb p ${RFS_PART_SECTOR_START}  ${RFS_PART_SECTOR_END}
-mkfs fat /dev/sdb1
-mount /dev/sdb1 /
-copy-in ${PWD}/${UBOOT_DIR}/u-boot.itb /
-copy-in ${PWD}/kernel.itb /
-copy-in ${PWD}/boot.scr.uimg /
-unmount /
-copy-device-to-device /dev/sda1 /dev/sdb2
-mount /dev/sdb2 /
-upload ${_DEBIAN_SHADOW_FILE} /etc/shadow
-chmod 0640 /etc/shadow
-upload ${_DEBIAN_FSTAB_FILE} /etc/fstab
-tar-in ${_LINUX_LM_TAR} /
-ln-sf sbin/init /init
-sync
+BOOT_IMG="boot.vfat"
+RFS_IMG="rootfs.ext4"
+RFS_CMDS="rootfs.debugfs"
+BOOT_PART_SECTORS=$(( ${BOOT_PART_SECTOR_END} - ${BOOT_PART_SECTOR_START} + 1 ))
+RFS_PART_SECTORS=$(( ${RFS_PART_SECTOR_END} - ${RFS_PART_SECTOR_START} + 1 ))
+
+# Partition table
+rm -f "${SDIMG}"
+truncate -s ${SDCARD_IMG_SIZE} "${SDIMG}"
+sfdisk --quiet "${SDIMG}" <<EOF
+label: dos
+start=${BOOT_PART_SECTOR_START}, size=${BOOT_PART_SECTORS}, type=c
+start=${RFS_PART_SECTOR_START}, size=${RFS_PART_SECTORS}, type=83
 EOF
 
-if [[ $? -ne 0 ]]; then
-    echo "ERROR: Failed to create SD card image"
+# Boot partition
+rm -f "${BOOT_IMG}"
+mkfs.vfat -C "${BOOT_IMG}" $(( ${BOOT_PART_SECTORS} / 2 )) >/dev/null
+MTOOLS_SKIP_CHECK=1 mcopy -i "${BOOT_IMG}" "${UBOOT_DIR}/u-boot.itb" kernel.itb boot.scr.uimg ::/
+
+# Root file system, extracted from the first partition of disk.raw
+read -r rfs_start rfs_sectors < <(partx -g -n 1 -o START,SECTORS disk.raw)
+if [[ ${rfs_sectors} -gt ${RFS_PART_SECTORS} ]]; then
+    echo "error: the Debian root file system does not fit in the SD card partition" >&2
     exit 1
 fi
+dd if=disk.raw of="${RFS_IMG}" bs=4M iflag=skip_bytes,count_bytes \
+   skip=$(( ${rfs_start} * 512 )) count=$(( ${rfs_sectors} * 512 )) conv=sparse status=none
+
+shadow_gid=$(debugfs -R "stat /etc/shadow" "${RFS_IMG}" 2>/dev/null | sed -n 's/.*Group: *\([0-9]*\).*/\1/p')
+
+# Debian merges /lib into /usr/lib: modules go to /usr/lib/modules so that
+# the /lib symlink is left untouched.
+{
+    echo "rm /etc/shadow"
+    echo "write \"${_DEBIAN_SHADOW_FILE}\" /etc/shadow"
+    echo "sif /etc/shadow mode 0100640"
+    echo "sif /etc/shadow gid ${shadow_gid:-0}"
+    echo "rm /etc/fstab"
+    echo "write \"${_DEBIAN_FSTAB_FILE}\" /etc/fstab"
+    echo "sif /etc/fstab mode 0100644"
+    rootfs_tree_cmds "${_LINUX_LM_DIR_ABS}/lib/modules" /usr/lib/modules
+    if rootfs_has "${RFS_IMG}" /init ; then
+        echo "rm /init"
+    fi
+    echo "symlink /init sbin/init"
+} > "${RFS_CMDS}"
+
+debugfs -w -f "${RFS_CMDS}" "${RFS_IMG}" >/dev/null
+
+# e2fsck returns 1 when it fixed something, which is fine
+e2fsck -fy "${RFS_IMG}" >/dev/null || [[ $? -le 1 ]]
+
+if ! rootfs_has "${RFS_IMG}" /init ; then
+    echo "ERROR: Failed to update the root file system" >&2
+    exit 1
+fi
+
+# Assemble the SD card image
+dd if="${BOOT_IMG}" of="${SDIMG}" bs=4M oflag=seek_bytes \
+   seek=$(( ${BOOT_PART_SECTOR_START} * 512 )) conv=notrunc,sparse status=none
+dd if="${RFS_IMG}" of="${SDIMG}" bs=4M oflag=seek_bytes \
+   seek=$(( ${RFS_PART_SECTOR_START} * 512 )) conv=notrunc,sparse status=none
+
+rm -f "${BOOT_IMG}" "${RFS_IMG}" "${RFS_CMDS}"
 
 cat <<EOS
 
