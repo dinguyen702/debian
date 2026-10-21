@@ -116,13 +116,13 @@ declare -r BOOT_PART_SIZE=$((200*${SZ_MB}))
 # HELPERS AND FUNCTIONS
 # =============================================================================
 
-# Match the Agilex 5 Buildroot genimage layout: a bootable FAT partition
-# starting immediately after the MBR. SPL fails to register FAT when the
-# partition is 1MiB-aligned the way sfdisk defaults to.
-declare -r BOOT_PART_SECTOR_START=1
-declare -r BOOT_PART_SECTORS=$(( ${BOOT_PART_SIZE} / 512 ))
-declare -r RFS_PART_SECTOR_START=$(( ${BOOT_PART_SECTOR_START} + ${BOOT_PART_SECTORS} ))
-declare -r RFS_PART_SECTORS=$(( ${RFS_PART_SIZE} / 512 )) 
+# Same layout the original guestfish script used. A type-c bootable
+# partition at sector 1 (Buildroot's genimage layout) does not boot
+# with this SPL; partition 1 at 2048 with type 83 does.
+declare -r BOOT_PART_SECTOR_START=2048
+declare -r BOOT_PART_SECTOR_END=$(( (${BOOT_PART_SIZE} / 512 ) + ${BOOT_PART_SECTOR_START}))
+declare -r RFS_PART_SECTOR_START=$((${BOOT_PART_SECTOR_END} + 1))
+declare -r RFS_PART_SECTOR_END=$(( (${RFS_PART_SIZE} / 512 ) + ${RFS_PART_SECTOR_START})) 
 
 # abs paths to files, handy later
 declare _DEBIAN_SHADOW_FILE="$(readlink -f ${DEBIAN_SHADOW_FILE})"
@@ -648,6 +648,8 @@ fi
 BOOT_IMG="boot.vfat"
 RFS_IMG="rootfs.ext4"
 RFS_CMDS="rootfs.debugfs"
+BOOT_PART_SECTORS=$(( ${BOOT_PART_SECTOR_END} - ${BOOT_PART_SECTOR_START} + 1 ))
+RFS_PART_SECTORS=$(( ${RFS_PART_SECTOR_END} - ${RFS_PART_SECTOR_START} + 1 ))
 
 # Partition table
 rm -f "${SDIMG}"
@@ -655,14 +657,16 @@ truncate -s ${SDCARD_IMG_SIZE} "${SDIMG}"
 sfdisk --quiet "${SDIMG}" <<EOF
 label: dos
 unit: sectors
-start=${BOOT_PART_SECTOR_START}, size=${BOOT_PART_SECTORS}, type=c, bootable
+start=${BOOT_PART_SECTOR_START}, size=${BOOT_PART_SECTORS}, type=83
 start=${RFS_PART_SECTOR_START}, size=${RFS_PART_SECTORS}, type=83
 EOF
 
-# Boot partition. Do not set hidden sectors: Buildroot's working image
-# leaves them at 0, matching a filesystem created as a standalone image.
+# Format a FAT filesystem the size of the partition itself. mkfs.vfat -C
+# takes KiB, so it cannot represent the odd 409601-sector size guestfish
+# used; hidden sectors must match the partition start.
 rm -f "${BOOT_IMG}"
-mkfs.vfat -C "${BOOT_IMG}" $(( ${BOOT_PART_SECTORS} / 2 )) >/dev/null
+truncate -s $(( ${BOOT_PART_SECTORS} * 512 )) "${BOOT_IMG}"
+mkfs.vfat -h ${BOOT_PART_SECTOR_START} "${BOOT_IMG}" >/dev/null
 MTOOLS_SKIP_CHECK=1 mcopy -i "${BOOT_IMG}" "${UBOOT_DIR}/u-boot.itb" kernel.itb boot.scr.uimg ::/
 
 # Root file system, extracted from the first partition of disk.raw
@@ -704,8 +708,8 @@ if ! rootfs_has "${RFS_IMG}" /init ; then
 fi
 
 # Assemble the SD card image
-dd if="${BOOT_IMG}" of="${SDIMG}" bs=4M oflag=seek_bytes \
-   seek=$(( ${BOOT_PART_SECTOR_START} * 512 )) conv=notrunc status=none
+dd if="${BOOT_IMG}" of="${SDIMG}" bs=512 seek=${BOOT_PART_SECTOR_START} \
+   conv=notrunc status=none
 dd if="${RFS_IMG}" of="${SDIMG}" bs=4M oflag=seek_bytes \
    seek=$(( ${RFS_PART_SECTOR_START} * 512 )) conv=notrunc,sparse status=none
 
