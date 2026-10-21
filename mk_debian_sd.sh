@@ -116,10 +116,13 @@ declare -r BOOT_PART_SIZE=$((200*${SZ_MB}))
 # HELPERS AND FUNCTIONS
 # =============================================================================
 
-declare -r BOOT_PART_SECTOR_START=2048
-declare -r BOOT_PART_SECTOR_END=$(( (${BOOT_PART_SIZE} / 512 ) + ${BOOT_PART_SECTOR_START})) 
-declare -r RFS_PART_SECTOR_START=$((${BOOT_PART_SECTOR_END} + 1))
-declare -r RFS_PART_SECTOR_END=$(( (${RFS_PART_SIZE} / 512 ) + ${RFS_PART_SECTOR_START})) 
+# Match the Agilex 5 Buildroot genimage layout: a bootable FAT partition
+# starting immediately after the MBR. SPL fails to register FAT when the
+# partition is 1MiB-aligned the way sfdisk defaults to.
+declare -r BOOT_PART_SECTOR_START=1
+declare -r BOOT_PART_SECTORS=$(( ${BOOT_PART_SIZE} / 512 ))
+declare -r RFS_PART_SECTOR_START=$(( ${BOOT_PART_SECTOR_START} + ${BOOT_PART_SECTORS} ))
+declare -r RFS_PART_SECTORS=$(( ${RFS_PART_SIZE} / 512 )) 
 
 # abs paths to files, handy later
 declare _DEBIAN_SHADOW_FILE="$(readlink -f ${DEBIAN_SHADOW_FILE})"
@@ -645,21 +648,21 @@ fi
 BOOT_IMG="boot.vfat"
 RFS_IMG="rootfs.ext4"
 RFS_CMDS="rootfs.debugfs"
-BOOT_PART_SECTORS=$(( ${BOOT_PART_SECTOR_END} - ${BOOT_PART_SECTOR_START} + 1 ))
-RFS_PART_SECTORS=$(( ${RFS_PART_SECTOR_END} - ${RFS_PART_SECTOR_START} + 1 ))
 
 # Partition table
 rm -f "${SDIMG}"
 truncate -s ${SDCARD_IMG_SIZE} "${SDIMG}"
 sfdisk --quiet "${SDIMG}" <<EOF
 label: dos
-start=${BOOT_PART_SECTOR_START}, size=${BOOT_PART_SECTORS}, type=83
+unit: sectors
+start=${BOOT_PART_SECTOR_START}, size=${BOOT_PART_SECTORS}, type=c, bootable
 start=${RFS_PART_SECTOR_START}, size=${RFS_PART_SECTORS}, type=83
 EOF
 
-# Boot partition, formatted as if created on the partition itself
+# Boot partition. Do not set hidden sectors: Buildroot's working image
+# leaves them at 0, matching a filesystem created as a standalone image.
 rm -f "${BOOT_IMG}"
-mkfs.vfat -h ${BOOT_PART_SECTOR_START} -C "${BOOT_IMG}" $(( ${BOOT_PART_SECTORS} / 2 )) >/dev/null
+mkfs.vfat -C "${BOOT_IMG}" $(( ${BOOT_PART_SECTORS} / 2 )) >/dev/null
 MTOOLS_SKIP_CHECK=1 mcopy -i "${BOOT_IMG}" "${UBOOT_DIR}/u-boot.itb" kernel.itb boot.scr.uimg ::/
 
 # Root file system, extracted from the first partition of disk.raw
