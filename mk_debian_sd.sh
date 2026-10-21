@@ -22,7 +22,7 @@
 #   - build-essential
 #   - bison
 #   - flex
-#   - fdisk (sfdisk), dosfstools, mtools and e2fsprogs for SD image creation
+#   - guestfs-tools for SD image creation
 #   - u-boot-tools
 #   - python3-setuptools
 #   - python3-dev
@@ -34,8 +34,9 @@
 #   - git
 #   - openssl
 #
-# The SD card image is assembled from regular files, so no root privileges
-# are needed to run this script.
+# This script uses guestfs tools to create an SD card image and does not
+# invoke sudo. guestfish needs a readable host kernel in /boot (Ubuntu
+# often ships vmlinuz as 0600) and is faster if you are in group kvm.
 #
 # =============================================================================
 
@@ -256,30 +257,33 @@ function write_root_shadow() {
     return 0
 }
 
-# rootfs_has <ext4 image> <path>: succeeds when <path> exists in the image
-function rootfs_has() {
+# guestfish/supermin boots a small appliance from /boot/vmlinuz-*. Ubuntu
+# packages that file as 0600, which makes supermin fail. Prefer the running
+# kernel if it is readable, otherwise the newest readable installed kernel.
+function setup_guestfish_kernel() {
 
-    debugfs -R "stat \"${2}\"" "${1}" 2>/dev/null | grep -q '^Inode:'
-}
+    local k
+    local kver
 
-# rootfs_tree_cmds <host dir> <image dir>: prints the debugfs commands that
-# copy the content of <host dir> into the existing <image dir>
-function rootfs_tree_cmds() {
+    if [[ -r "/boot/vmlinuz-$(uname -r)" && -d "/lib/modules/$(uname -r)" ]]; then
+        return 0
+    fi
 
-    local src="${1}"
-    local dst="${2}"
-    local type
-    local path
-
-    (cd "${src}" && find . -mindepth 1 -printf '%y %P\n') | while read -r type path ; do
-        case "${type}" in
-            d) echo "mkdir \"${dst}/${path}\"" ;;
-            f) echo "write \"${src}/${path}\" \"${dst}/${path}\"" ;;
-            l) echo "symlink \"${dst}/${path}\" \"$(readlink "${src}/${path}")\"" ;;
-            *) echo "${FUNCNAME}: error: unsupported file type: ${src}/${path}" >&2
-               return 1 ;;
-        esac
+    for k in $(ls -1 /boot/vmlinuz-* 2>/dev/null | sort -V -r); do
+        if [[ -r "${k}" ]]; then
+            kver="${k#/boot/vmlinuz-}"
+            if [[ -d "/lib/modules/${kver}" ]]; then
+                export SUPERMIN_KERNEL="${k}"
+                export SUPERMIN_MODULES="/lib/modules/${kver}"
+                echo "guestfish: using readable kernel ${k}"
+                return 0
+            fi
+        fi
     done
+
+    echo "error: guestfish needs a readable /boot/vmlinuz-* (Ubuntu often installs them as 0600)" >&2
+    echo "Make one readable, for example: chmod a+r /boot/vmlinuz-$(uname -r)" >&2
+    return 1
 }
 
 # =============================================================================
@@ -472,6 +476,7 @@ echo "[STEP] Building Linux kernel..."
 
 rm -rf ${LINUX_LM_DIR} && mkdir ${LINUX_LM_DIR}
 _LINUX_LM_DIR_ABS="$(readlink -f ${LINUX_LM_DIR})"
+_LINUX_LM_TAR="${PWD}/linux-modules.tar"
 
 if [[ ! -d "${LINUX_DIR}" ]]; then
     clone_and_checkout "${LINUX_REPO}" "${LINUX_REF}" "${LINUX_DIR}"
@@ -492,6 +497,14 @@ make oldconfig
 make -j "${JOBS}" Image && make "${LINUX_DTB}"
 make -j "${JOBS}" modules 
 make -j "${JOBS}" modules_install INSTALL_MOD_PATH="${_LINUX_LM_DIR_ABS}"
+
+cd ${_LINUX_LM_DIR_ABS}
+# Debian merges /lib into /usr/lib. A tarball rooted at lib/ replaces that
+# symlink, which removes /lib/systemd. Place modules under usr/lib instead.
+mkdir -p usr
+rm -rf usr/lib
+mv lib usr/lib
+tar cf ${_LINUX_LM_TAR} usr/lib/modules
 
 cd ..
 
@@ -645,75 +658,39 @@ if ! write_root_shadow ; then
     exit 1
 fi
 
-BOOT_IMG="boot.vfat"
-RFS_IMG="rootfs.ext4"
-RFS_CMDS="rootfs.debugfs"
-BOOT_PART_SECTORS=$(( ${BOOT_PART_SECTOR_END} - ${BOOT_PART_SECTOR_START} + 1 ))
-RFS_PART_SECTORS=$(( ${RFS_PART_SECTOR_END} - ${RFS_PART_SECTOR_START} + 1 ))
+if ! setup_guestfish_kernel ; then
+    exit 1
+fi
 
-# Partition table
-rm -f "${SDIMG}"
-truncate -s ${SDCARD_IMG_SIZE} "${SDIMG}"
-sfdisk --quiet "${SDIMG}" <<EOF
-label: dos
-unit: sectors
-start=${BOOT_PART_SECTOR_START}, size=${BOOT_PART_SECTORS}, type=83
-start=${RFS_PART_SECTOR_START}, size=${RFS_PART_SECTORS}, type=83
+# Guestfish formats the FAT partition in-place. Recreating that with
+# sfdisk/mkfs.vfat produced a matching partition table that SPL still
+# rejected (fat register err -1).
+guestfish --ro -a disk.raw <<EOF
+sparse ${SDIMG} ${SDCARD_IMG_SIZE}
+run
+part-init /dev/sdb mbr
+part-add /dev/sdb p ${BOOT_PART_SECTOR_START} ${BOOT_PART_SECTOR_END}
+part-add /dev/sdb p ${RFS_PART_SECTOR_START}  ${RFS_PART_SECTOR_END}
+mkfs fat /dev/sdb1
+mount /dev/sdb1 /
+copy-in ${PWD}/${UBOOT_DIR}/u-boot.itb /
+copy-in ${PWD}/kernel.itb /
+copy-in ${PWD}/boot.scr.uimg /
+unmount /
+copy-device-to-device /dev/sda1 /dev/sdb2
+mount /dev/sdb2 /
+upload ${_DEBIAN_SHADOW_FILE} /etc/shadow
+chmod 0640 /etc/shadow
+upload ${_DEBIAN_FSTAB_FILE} /etc/fstab
+tar-in ${_LINUX_LM_TAR} /
+ln-sf sbin/init /init
+sync
 EOF
 
-# Format a FAT filesystem the size of the partition itself. mkfs.vfat -C
-# takes KiB, so it cannot represent the odd 409601-sector size guestfish
-# used; hidden sectors must match the partition start.
-rm -f "${BOOT_IMG}"
-truncate -s $(( ${BOOT_PART_SECTORS} * 512 )) "${BOOT_IMG}"
-mkfs.vfat -h ${BOOT_PART_SECTOR_START} "${BOOT_IMG}" >/dev/null
-MTOOLS_SKIP_CHECK=1 mcopy -i "${BOOT_IMG}" "${UBOOT_DIR}/u-boot.itb" kernel.itb boot.scr.uimg ::/
-
-# Root file system, extracted from the first partition of disk.raw
-read -r rfs_start rfs_sectors < <(partx -g -n 1 -o START,SECTORS disk.raw)
-if [[ ${rfs_sectors} -gt ${RFS_PART_SECTORS} ]]; then
-    echo "error: the Debian root file system does not fit in the SD card partition" >&2
+if [[ $? -ne 0 ]]; then
+    echo "ERROR: Failed to create SD card image"
     exit 1
 fi
-dd if=disk.raw of="${RFS_IMG}" bs=4M iflag=skip_bytes,count_bytes \
-   skip=$(( ${rfs_start} * 512 )) count=$(( ${rfs_sectors} * 512 )) conv=sparse status=none
-
-shadow_gid=$(debugfs -R "stat /etc/shadow" "${RFS_IMG}" 2>/dev/null | sed -n 's/.*Group: *\([0-9]*\).*/\1/p')
-
-# Debian merges /lib into /usr/lib: modules go to /usr/lib/modules so that
-# the /lib symlink is left untouched.
-{
-    echo "rm /etc/shadow"
-    echo "write \"${_DEBIAN_SHADOW_FILE}\" /etc/shadow"
-    echo "sif /etc/shadow mode 0100640"
-    echo "sif /etc/shadow gid ${shadow_gid:-0}"
-    echo "rm /etc/fstab"
-    echo "write \"${_DEBIAN_FSTAB_FILE}\" /etc/fstab"
-    echo "sif /etc/fstab mode 0100644"
-    rootfs_tree_cmds "${_LINUX_LM_DIR_ABS}/lib/modules" /usr/lib/modules
-    if rootfs_has "${RFS_IMG}" /init ; then
-        echo "rm /init"
-    fi
-    echo "symlink /init sbin/init"
-} > "${RFS_CMDS}"
-
-debugfs -w -f "${RFS_CMDS}" "${RFS_IMG}" >/dev/null
-
-# e2fsck returns 1 when it fixed something, which is fine
-e2fsck -fy "${RFS_IMG}" >/dev/null || [[ $? -le 1 ]]
-
-if ! rootfs_has "${RFS_IMG}" /init ; then
-    echo "ERROR: Failed to update the root file system" >&2
-    exit 1
-fi
-
-# Assemble the SD card image
-dd if="${BOOT_IMG}" of="${SDIMG}" bs=512 seek=${BOOT_PART_SECTOR_START} \
-   conv=notrunc status=none
-dd if="${RFS_IMG}" of="${SDIMG}" bs=4M oflag=seek_bytes \
-   seek=$(( ${RFS_PART_SECTOR_START} * 512 )) conv=notrunc,sparse status=none
-
-rm -f "${BOOT_IMG}" "${RFS_IMG}" "${RFS_CMDS}"
 
 cat <<EOS
 
