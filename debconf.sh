@@ -14,3 +14,6 @@ UBOOT_SCRIPT_URL="https://raw.githubusercontent.com/altera-fpga/meta-altera-fpga
 
 FABRIC_RBF_FILE=
 FABRIC_RBF_URL=
+
+# FIT config board-${BOARD_ID}; used by the U-Boot script if unset in env
+BOARD_ID=0

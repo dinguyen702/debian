@@ -54,7 +54,7 @@ declare -r _BRANCH="work"
 
 declare -r DEF_CONFIG_FILE="debconf.sh"
 declare -r CONFIG_MANDATORY="ATF_REPO ATF_REF UBOOT_REPO UBOOT_REF LINUX_REPO LINUX_REF"
-declare -r CONFIG_OPTIONAL="UBOOT_ITS_FILE UBOOT_ITS_URL UBOOT_SCRIPT_FILE UBOOT_SCRIPT_URL FABRIC_RBF_FILE FABRIC_RBF_URL"
+declare -r CONFIG_OPTIONAL="UBOOT_ITS_FILE UBOOT_ITS_URL UBOOT_SCRIPT_FILE UBOOT_SCRIPT_URL FABRIC_RBF_FILE FABRIC_RBF_URL BOARD_ID"
 
 # Component URLs and settings
 # Using the musl compiler to make a tight, statically linked Linux environment
@@ -81,6 +81,9 @@ declare -r DEF_UBOOT_SCRIPT_URL="https://raw.githubusercontent.com/altera-fpga/m
 
 declare -r DEF_FABRIC_RBF_FILE=""
 declare -r DEF_FABRIC_RBF_URL=""
+# FIT configuration name is board-${BOARD_ID}; the boot script uses the
+# same value when U-Boot has no board_id in the environment.
+declare -r DEF_BOARD_ID="0"
 
 declare -r DEBIAN_NAME="trixie"
 declare -r DEBIAN_VERSION="13"
@@ -337,6 +340,7 @@ UBOOT_SCRIPT_FILE=${UBOOT_SCRIPT_FILE:-${DEF_UBOOT_SCRIPT_FILE}}
 UBOOT_SCRIPT_URL=${UBOOT_SCRIPT_URL:-${DEF_UBOOT_SCRIPT_URL}}
 FABRIC_RBF_FILE=${FABRIC_RBF_FILE:-${DEF_FABRIC_RBF_FILE}}
 FABRIC_RBF_URL=${FABRIC_RBF_URL:-${DEF_FABRIC_RBF_URL}}
+BOARD_ID=${BOARD_ID:-${DEF_BOARD_ID}}
 
 # =============================================================================
 # BUILD PROCESS
@@ -463,6 +467,14 @@ if ! download "${UBOOT_SCRIPT_URL}" "${UBOOT_SCRIPT_FILE}" ; then
 	echo "error: failed to dowbload ${UBOOT_SCRIPT_FILE}"
 	exit 3
 fi
+
+# The Altera script does bootm ${loadaddr}#board-${board_id}. Set a
+# default when the environment does not already have one.
+{
+	echo "if test -z \"\${board_id}\"; then setenv board_id ${BOARD_ID}; fi"
+	cat "${UBOOT_SCRIPT_FILE}"
+} > "${UBOOT_SCRIPT_FILE}.new"
+mv "${UBOOT_SCRIPT_FILE}.new" "${UBOOT_SCRIPT_FILE}"
 
 mkimage -f "${UBOOT_ITS_FILE}" boot.scr.uimg
 
@@ -601,15 +613,25 @@ cat >> kernel_test.its <<EOF
 
     configurations {
 
-        default = "board-0";
+        default = "board-${BOARD_ID}";
 
-        board-0 {
+        board-${BOARD_ID} {
 
-            description = "board_0";
+            description = "board_${BOARD_ID}";
 
             kernel = "kernel";
 
             fdt = "fdt-0";
+EOF
+
+if [ ! -z ${FABRIC_RBF_FILE} -a ! -z ${FABRIC_RBF_URL} ] ; then
+    cat >> kernel_test.its <<EOF
+
+            fpga = "fpga-0";
+EOF
+fi
+
+cat >> kernel_test.its <<EOF
 
             hash-1 { algo = "crc32"; };
 
