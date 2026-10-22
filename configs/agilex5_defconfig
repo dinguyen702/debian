@@ -9,4 +9,5 @@ CONFIG_UBOOT_SCRIPT_URL="https://raw.githubusercontent.com/altera-fpga/meta-alte
 CONFIG_LINUX_REPO="https://github.com/altera-fpga/linux-socfpga.git"
 CONFIG_LINUX_REF="socfpga-6.18.20-lts"
 CONFIG_LINUX_CONFIG_FRAGMENT=""
+CONFIG_BOARD_ID="0"
 # CONFIG_FABRIC_RBF is not set

@@ -69,6 +69,18 @@ config LINUX_CONFIG_FRAGMENT
 
 endmenu
 
+menu "Board"
+
+config BOARD_ID
+	string "U-Boot / FIT board_id"
+	default "0"
+	help
+	  FIT configuration name is board-${BOARD_ID}. The boot script
+	  sets U-Boot's board_id to this value when it is not already
+	  in the environment, then runs bootm ...#board-${board_id}.
+
+endmenu
+
 menu "FPGA fabric"
 
 config FABRIC_RBF
