@@ -9,7 +9,9 @@
 # The SD card image produced from this script will demonstrate the HPS first boot flow
 #
 # USAGE:
-#   ./mk_debian_sd.sh [-c debconf.sh]
+#   make menuconfig          # optional, writes .config
+#   ./mk_debian_sd.sh        # uses .config if present, else debconf.sh
+#   ./mk_debian_sd.sh [-c file]
 #
 # OUTPUT:
 #   sdcard_agilex5.img - Ready to write to SD card
@@ -52,9 +54,11 @@ declare -r OUTPUT_DIR_ABS="$(readlink -f ${OUTPUT_DIR})"
 declare -r JOBS=$(nproc)
 declare -r _BRANCH="work"
 
+declare -r TOP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 declare -r DEF_CONFIG_FILE="debconf.sh"
+declare -r DEF_KCONFIG_FILE=".config"
 declare -r CONFIG_MANDATORY="ATF_REPO ATF_REF UBOOT_REPO UBOOT_REF LINUX_REPO LINUX_REF"
-declare -r CONFIG_OPTIONAL="UBOOT_ITS_FILE UBOOT_ITS_URL UBOOT_SCRIPT_FILE UBOOT_SCRIPT_URL FABRIC_RBF_FILE FABRIC_RBF_URL"
+declare -r CONFIG_OPTIONAL="UBOOT_ITS_FILE UBOOT_ITS_URL UBOOT_SCRIPT_FILE UBOOT_SCRIPT_URL FABRIC_RBF_FILE FABRIC_RBF_URL LINUX_CONFIG_FRAGMENT"
 
 # Component URLs and settings
 # Using the musl compiler to make a tight, statically linked Linux environment
@@ -139,9 +143,15 @@ Builds an Agilex 5 SD card image with an unmodified Debian run time.
 
 Usage: ${SELF} [-h] [-c <file>]
     -h: prints this message
-    -c: specifies a configuration file to use.
+    -c: configuration file (.config from make menuconfig, or a shell file)
 
-Configuration file
+If -c is omitted, ${DEF_KCONFIG_FILE} is used when it exists, otherwise ${DEF_CONFIG_FILE}.
+
+  make menuconfig    configure with Kconfig (writes ${DEF_KCONFIG_FILE})
+  make defconfig     write ${DEF_KCONFIG_FILE} from configs/agilex5_defconfig
+
+A Kconfig file uses CONFIG_* symbols (ATF_REPO, UBOOT_REF, ...).
+A shell file sets the same names without the CONFIG_ prefix.
 
 Must include the following mandatory variables:
 ${CONFIG_MANDATORY}
@@ -185,6 +195,48 @@ function download() {
     fi  
 
     return ${err}
+}
+
+# Load a kernel-style .config into ATF_REPO, UBOOT_REF, ...
+function load_kconfig() {
+
+    local file="${1}"
+    local line
+    local key
+    local val
+
+    while IFS= read -r line || [[ -n ${line} ]]; do
+        if [[ ${line} =~ ^#\ CONFIG_([A-Za-z0-9_]+)\ is\ not\ set ]]; then
+            unset "${BASH_REMATCH[1]}"
+            continue
+        fi
+        [[ ${line} == CONFIG_* ]] || continue
+        key=${line%%=*}
+        val=${line#*=}
+        key=${key#CONFIG_}
+        if [[ ${val} == \"*\" ]]; then
+            val=${val:1:-1}
+        fi
+        printf -v "${key}" '%s' "${val}"
+    done < "${file}"
+
+    if [[ ${FABRIC_RBF:-n} != y ]]; then
+        FABRIC_RBF_FILE=""
+        FABRIC_RBF_URL=""
+    fi
+
+    return 0
+}
+
+function apply_config_file() {
+
+    local file="${1}"
+
+    if grep -q '^CONFIG_' "${file}"; then
+        load_kconfig "${file}"
+    else
+        source "${file}"
+    fi
 }
 
 function check_config () {
@@ -289,7 +341,7 @@ function setup_guestfish_kernel() {
 # =============================================================================
 # CLI 
 # =============================================================================
-declare CONFIG_FILE="${DEF_CONFIG_FILE}"
+declare CONFIG_FILE=""
 
 while [[ $# -gt 0 ]]; do
     case "${1}" in
@@ -321,8 +373,16 @@ echo "======================================================================"
 # =============================================================================
 # CHECK CONFIG
 # =============================================================================
+if [ -z ${CONFIG_FILE} ] ; then
+    if [ -f ${DEF_KCONFIG_FILE} ] ; then
+        CONFIG_FILE="${DEF_KCONFIG_FILE}"
+    else
+        CONFIG_FILE="${DEF_CONFIG_FILE}"
+    fi
+fi
+
 echo "[STEP] configuring from ${CONFIG_FILE}..."
-source "${CONFIG_FILE}"
+apply_config_file "${CONFIG_FILE}"
 
 if ! check_config ; then
     echo "Please check your configuration in ${CONFIG_FILE}..."
@@ -337,6 +397,7 @@ UBOOT_SCRIPT_FILE=${UBOOT_SCRIPT_FILE:-${DEF_UBOOT_SCRIPT_FILE}}
 UBOOT_SCRIPT_URL=${UBOOT_SCRIPT_URL:-${DEF_UBOOT_SCRIPT_URL}}
 FABRIC_RBF_FILE=${FABRIC_RBF_FILE:-${DEF_FABRIC_RBF_FILE}}
 FABRIC_RBF_URL=${FABRIC_RBF_URL:-${DEF_FABRIC_RBF_URL}}
+LINUX_CONFIG_FRAGMENT=${LINUX_CONFIG_FRAGMENT:-}
 
 # =============================================================================
 # BUILD PROCESS
@@ -493,6 +554,17 @@ EOF
 # Configure and build kernel
 make defconfig
 ./scripts/kconfig/merge_config.sh -O ./ ./.config ./config-fragment-agilex5
+if [ -n "${LINUX_CONFIG_FRAGMENT}" ] ; then
+    _LINUX_FRAG="${LINUX_CONFIG_FRAGMENT}"
+    if [ ! -f ${_LINUX_FRAG} ] ; then
+        _LINUX_FRAG="${TOP_DIR}/${LINUX_CONFIG_FRAGMENT}"
+    fi
+    if [ ! -f ${_LINUX_FRAG} ] ; then
+        echo "error: kernel config fragment not found: ${LINUX_CONFIG_FRAGMENT}" >&2
+        exit 1
+    fi
+    ./scripts/kconfig/merge_config.sh -O ./ ./.config "${_LINUX_FRAG}"
+fi
 make oldconfig
 make -j "${JOBS}" Image && make "${LINUX_DTB}"
 make -j "${JOBS}" modules 

@@ -1,0 +1,88 @@
+mainmenu "Agilex 5 Debian SD card image"
+
+menu "ARM Trusted Firmware"
+
+config ATF_REPO
+	string "ATF git repository"
+	default "https://github.com/altera-fpga/arm-trusted-firmware.git"
+	help
+	  Git URL of the Arm Trusted Firmware tree.
+
+config ATF_REF
+	string "ATF git reference"
+	default "socfpga_v2.14.1"
+	help
+	  Tag, branch, or SHA to check out.
+
+endmenu
+
+menu "U-Boot"
+
+config UBOOT_REPO
+	string "U-Boot git repository"
+	default "https://github.com/altera-fpga/u-boot-socfpga.git"
+
+config UBOOT_REF
+	string "U-Boot git reference"
+	default "socfpga_v2026.04"
+	help
+	  Tag, branch, or SHA to check out.
+
+config UBOOT_ITS_FILE
+	string "U-Boot script ITS file name"
+	default "uboot_script.its"
+
+config UBOOT_ITS_URL
+	string "U-Boot script ITS URL"
+	default "https://raw.githubusercontent.com/altera-fpga/meta-altera-fpga/whinlatter/meta-altera-bsp/recipes-bsp/u-boot/bootscr/uboot_script.its"
+
+config UBOOT_SCRIPT_FILE
+	string "U-Boot script source file name"
+	default "uboot.txt"
+
+config UBOOT_SCRIPT_URL
+	string "U-Boot script source URL"
+	default "https://raw.githubusercontent.com/altera-fpga/meta-altera-fpga/whinlatter/meta-altera-bsp/recipes-bsp/u-boot/bootscr/uboot.txt"
+
+endmenu
+
+menu "Linux kernel"
+
+config LINUX_REPO
+	string "Linux git repository"
+	default "https://github.com/altera-fpga/linux-socfpga.git"
+
+config LINUX_REF
+	string "Linux git reference"
+	default "socfpga-6.18.20-lts"
+	help
+	  Tag, branch, or SHA to check out.
+
+config LINUX_CONFIG_FRAGMENT
+	string "Extra kernel config fragment"
+	default ""
+	help
+	  Optional path to a kernel config fragment merged after
+	  defconfig. Relative paths are from the directory that
+	  contains mk_debian_sd.sh. The built-in Agilex 5 Ethernet
+	  fragment is always applied.
+
+endmenu
+
+menu "FPGA fabric"
+
+config FABRIC_RBF
+	bool "Include an FPGA fabric RBF in the FIT image"
+	default n
+
+config FABRIC_RBF_FILE
+	string "RBF file name"
+	depends on FABRIC_RBF
+	default ""
+
+config FABRIC_RBF_URL
+	string "RBF download URL"
+	depends on FABRIC_RBF
+	default ""
+
+endmenu

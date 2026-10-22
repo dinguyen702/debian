@@ -1,0 +1,12 @@
+CONFIG_ATF_REPO="https://github.com/altera-fpga/arm-trusted-firmware.git"
+CONFIG_ATF_REF="socfpga_v2.14.1"
+CONFIG_UBOOT_REPO="https://github.com/altera-fpga/u-boot-socfpga.git"
+CONFIG_UBOOT_REF="socfpga_v2026.04"
+CONFIG_UBOOT_ITS_FILE="uboot_script.its"
+CONFIG_UBOOT_ITS_URL="https://raw.githubusercontent.com/altera-fpga/meta-altera-fpga/whinlatter/meta-altera-bsp/recipes-bsp/u-boot/bootscr/uboot_script.its"
+CONFIG_UBOOT_SCRIPT_FILE="uboot.txt"
+CONFIG_UBOOT_SCRIPT_URL="https://raw.githubusercontent.com/altera-fpga/meta-altera-fpga/whinlatter/meta-altera-bsp/recipes-bsp/u-boot/bootscr/uboot.txt"
+CONFIG_LINUX_REPO="https://github.com/altera-fpga/linux-socfpga.git"
+CONFIG_LINUX_REF="socfpga-6.18.20-lts"
+CONFIG_LINUX_CONFIG_FRAGMENT=""
+# CONFIG_FABRIC_RBF is not set
