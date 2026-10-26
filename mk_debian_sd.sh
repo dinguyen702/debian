@@ -15,11 +15,11 @@
 #   sdcard_agilex5.img - Ready to write to SD card
 #
 # REQUIREMENTS:
-# - Linux host system (Ubuntu 22.04+ recommended)
+# - Linux host or container with a C compiler (gcc or cc) on PATH
 # - Internet connection for downloading sources
 # - ~20GB free disk space
 # - Packages:
-#   - build-essential
+#   - gcc (or cc) and g++ for host tools
 #   - bison
 #   - flex
 #   - guestfs-tools for SD image creation
@@ -289,6 +289,47 @@ function setup_guestfish_kernel() {
     return 1
 }
 
+# Resolve a native host compiler to an absolute path. Do this before the
+# cross toolchain is prepended to PATH so make's host tools are not built
+# with the musl compiler. Prefers HOSTCC/HOSTCXX if already set.
+function find_host_cc() {
+
+    local cc="${HOSTCC:-}"
+    local cxx="${HOSTCXX:-}"
+    local resolved
+
+    if [[ -z ${cc} ]]; then
+        cc=$(command -v gcc || command -v cc || true)
+    elif ! command -v "${cc}" >/dev/null 2>&1 && [[ ! -x ${cc} ]]; then
+        cc=""
+    fi
+
+    if [[ -z ${cc} ]]; then
+        echo "error: no host C compiler found (set HOSTCC, or install gcc/cc)" >&2
+        return 1
+    fi
+
+    resolved=$(command -v "${cc}" 2>/dev/null || true)
+    HOSTCC=$(readlink -f "${resolved:-${cc}}")
+
+    if [[ -z ${cxx} ]]; then
+        cxx=$(command -v g++ || command -v c++ || true)
+    fi
+    if [[ -n ${cxx} ]]; then
+        resolved=$(command -v "${cxx}" 2>/dev/null || true)
+        HOSTCXX=$(readlink -f "${resolved:-${cxx}}")
+    else
+        HOSTCXX="${HOSTCC}"
+    fi
+
+    if [[ ! -x ${HOSTCC} ]]; then
+        echo "error: host C compiler is not executable: ${HOSTCC}" >&2
+        return 1
+    fi
+
+    return 0
+}
+
 # =============================================================================
 # CLI 
 # =============================================================================
@@ -348,6 +389,11 @@ BOARD_ID=${BOARD_ID:-${DEF_BOARD_ID}}
 
 echo "[STEP] Setting up build environment..."
 
+if ! find_host_cc ; then
+    exit 1
+fi
+declare -rx HOSTCC HOSTCXX
+
 # Create and enter build directory
 mkdir -p "${OUTPUT_DIR}"
 cd "${OUTPUT_DIR}"
@@ -358,6 +404,7 @@ declare -rx CROSS_COMPILE="${PWD}/${TOOLCHAIN_DIR}/bin/aarch64-unknown-linux-mus
 
 echo "Build directory: ${PWD}"
 echo "Architecture: ${ARCH}"
+echo "Host compiler: ${HOSTCC}"
 echo "Cross compiler: ${CROSS_COMPILE}"
 
 # =============================================================================
@@ -407,8 +454,8 @@ fi
 cd "${ATF_DIR}"
 
 # Clean and build ATF
-make clean
-make -j "${JOBS}" PLAT="${ATF_PLAT}" bl31 ENABLE_LTO=0
+make HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" clean
+make -j "${JOBS}" HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" PLAT="${ATF_PLAT}" bl31 ENABLE_LTO=0
 
 cd ..
 
@@ -434,13 +481,13 @@ sed -i 's/PLATFORM_CPPFLAGS += -D__ARM__/PLATFORM_CPPFLAGS += -D__ARM__ -gdwarf-
 sed -i 's/u-boot,spl-boot-order.*/u-boot,spl-boot-order = \&mmc;/g' "${UBOOT_DTSI}"
 
 # Build U-Boot
-make clean && make mrproper
-make "${UBOOT_DEFCONFIG}"
+make HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" clean && make HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" mrproper
+make HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" "${UBOOT_DEFCONFIG}"
 
 # Link directly to ATF bl31.bin in its build directory
 ln -sf "../${ATF_DIR}/build/${ATF_PLAT}/release/bl31.bin" .
 
-make -j "${JOBS}"
+make -j "${JOBS}" HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}"
 
 # spl hex file is needed when JIC file is created. Copy it at a known location
 cp spl/u-boot-spl-dtb.hex ${OUTPUT_DIR_ABS} 
@@ -503,7 +550,7 @@ CONFIG_MARVELL_PHY=y
 EOF
 
 # Configure and build kernel
-make defconfig
+make HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" defconfig
 ./scripts/kconfig/merge_config.sh -O ./ ./.config ./config-fragment-agilex5
 make oldconfig
 make -j "${JOBS}" Image && make "${LINUX_DTB}"
