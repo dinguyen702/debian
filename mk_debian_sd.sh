@@ -30,7 +30,7 @@
 #   - bc 
 #   - xz-utils
 #   - swig
-#   - curl  
+#   - wget
 #   - git
 #   - openssl
 #
@@ -179,13 +179,13 @@ function download() {
     local url="${1}"
     local err=0
 
-    if command -v curl >/dev/null 2>&1; then
-        curl -L --progress-bar -o "${archive}" "${url}"
+    if command -v wget >/dev/null 2>&1; then
+        wget -O "${archive}" "${url}"
 	err=$?
     else
-        echo "ERROR: curl not found. Please install it"
+        echo "ERROR: wget not found. Please install it"
         return 1
-    fi  
+    fi
 
     return ${err}
 }
