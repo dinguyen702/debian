@@ -289,42 +289,68 @@ function setup_guestfish_kernel() {
     return 1
 }
 
+# True when PATH entry is a ccache wrapper (often /usr/lib/ccache/gcc -> ccache).
+# Using that as HOSTCC makes make pass -W... to ccache, which errors.
+function cc_is_ccache() {
+
+    local real
+
+    real=$(readlink -f "${1}")
+    [[ $(basename "${real}") == ccache ]]
+}
+
+# Print the first executable named like gcc/cc that is not a ccache wrapper.
+# $1 is an optional explicit compiler (HOSTCC/HOSTCXX); remaining args are
+# names to search on PATH.
+function lookup_host_compiler() {
+
+    local hint="${1:-}"
+    local name
+    local dir
+    local cand
+    local IFS
+    shift || true
+
+    if [[ -n ${hint} ]]; then
+        if [[ -x ${hint} ]]; then
+            cand="${hint}"
+        else
+            cand=$(command -v "${hint}" 2>/dev/null || true)
+        fi
+        if [[ -n ${cand} && -x ${cand} ]] && ! cc_is_ccache "${cand}"; then
+            echo "${cand}"
+            return 0
+        fi
+    fi
+
+    IFS=:
+    for name in "$@" ; do
+        for dir in ${PATH} ; do
+            [[ -n ${dir} ]] || continue
+            cand="${dir}/${name}"
+            [[ -x ${cand} ]] || continue
+            if cc_is_ccache "${cand}"; then
+                continue
+            fi
+            echo "${cand}"
+            return 0
+        done
+    done
+    return 1
+}
+
 # Resolve a native host compiler to an absolute path. Do this before the
 # cross toolchain is prepended to PATH so make's host tools are not built
 # with the musl compiler. Prefers HOSTCC/HOSTCXX if already set.
 function find_host_cc() {
 
-    local cc="${HOSTCC:-}"
-    local cxx="${HOSTCXX:-}"
-    local resolved
-
-    if [[ -z ${cc} ]]; then
-        cc=$(command -v gcc || command -v cc || true)
-    elif ! command -v "${cc}" >/dev/null 2>&1 && [[ ! -x ${cc} ]]; then
-        cc=""
-    fi
-
-    if [[ -z ${cc} ]]; then
+    if ! HOSTCC=$(lookup_host_compiler "${HOSTCC:-}" gcc cc); then
         echo "error: no host C compiler found (set HOSTCC, or install gcc/cc)" >&2
         return 1
     fi
 
-    resolved=$(command -v "${cc}" 2>/dev/null || true)
-    HOSTCC=$(readlink -f "${resolved:-${cc}}")
-
-    if [[ -z ${cxx} ]]; then
-        cxx=$(command -v g++ || command -v c++ || true)
-    fi
-    if [[ -n ${cxx} ]]; then
-        resolved=$(command -v "${cxx}" 2>/dev/null || true)
-        HOSTCXX=$(readlink -f "${resolved:-${cxx}}")
-    else
+    if ! HOSTCXX=$(lookup_host_compiler "${HOSTCXX:-}" g++ c++); then
         HOSTCXX="${HOSTCC}"
-    fi
-
-    if [[ ! -x ${HOSTCC} ]]; then
-        echo "error: host C compiler is not executable: ${HOSTCC}" >&2
-        return 1
     fi
 
     return 0
