@@ -35,8 +35,11 @@
 #   - openssl
 #
 # This script uses guestfs tools to create an SD card image and does not
-# invoke sudo. guestfish needs a readable host kernel in /boot (Ubuntu
-# often ships vmlinuz as 0600) and is faster if you are in group kvm.
+# invoke sudo. guestfish/supermin boots a qemu appliance with a host
+# kernel; Ubuntu's /boot/vmlinuz-* is often 0600, so this script does
+# not read /boot. It uses /lib/modules/*/vmlinuz when that exists, or
+# extracts vmlinuz from the linux-image .deb into the build directory.
+# It is faster if you are in group kvm.
 #
 # =============================================================================
 
@@ -260,33 +263,127 @@ function write_root_shadow() {
     return 0
 }
 
-# guestfish/supermin boots a small appliance from /boot/vmlinuz-*. Ubuntu
-# packages that file as 0600, which makes supermin fail. Prefer the running
-# kernel if it is readable, otherwise the newest readable installed kernel.
+# guestfish/supermin boots a small qemu appliance. It needs a readable
+# host-arch kernel and matching modules, but not the files in /boot
+# (Ubuntu ships those as 0600). Prefer SUPERMIN_KERNEL if set, then a
+# vmlinuz next to /lib/modules, then a copy extracted from linux-image.
 function setup_guestfish_kernel() {
 
     local k
     local kver
+    local dest
+    local pkg
+    local deb
+    local uri
+    local uris
 
-    if [[ -r "/boot/vmlinuz-$(uname -r)" && -d "/lib/modules/$(uname -r)" ]]; then
-        return 0
+    if [[ -n ${SUPERMIN_KERNEL:-} ]]; then
+        if [[ -r ${SUPERMIN_KERNEL} ]]; then
+            echo "guestfish: using SUPERMIN_KERNEL=${SUPERMIN_KERNEL}"
+            return 0
+        fi
+        echo "error: SUPERMIN_KERNEL=${SUPERMIN_KERNEL} is not readable" >&2
+        return 1
     fi
 
-    for k in $(ls -1 /boot/vmlinuz-* 2>/dev/null | sort -V -r); do
-        if [[ -r "${k}" ]]; then
-            kver="${k#/boot/vmlinuz-}"
-            if [[ -d "/lib/modules/${kver}" ]]; then
-                export SUPERMIN_KERNEL="${k}"
-                export SUPERMIN_MODULES="/lib/modules/${kver}"
-                echo "guestfish: using readable kernel ${k}"
-                return 0
-            fi
+    for k in /lib/modules/$(uname -r)/vmlinuz /usr/lib/modules/$(uname -r)/vmlinuz; do
+        if [[ -r ${k} ]]; then
+            export SUPERMIN_KERNEL="${k}"
+            export SUPERMIN_MODULES="$(dirname "${k}")"
+            export SUPERMIN_KERNEL_VERSION="$(uname -r)"
+            echo "guestfish: using ${k}"
+            return 0
         fi
     done
 
-    echo "error: guestfish needs a readable /boot/vmlinuz-* (Ubuntu often installs them as 0600)" >&2
-    echo "Make one readable, for example: chmod a+r /boot/vmlinuz-$(uname -r)" >&2
-    return 1
+    k=""
+    for kver in /lib/modules/*/vmlinuz /usr/lib/modules/*/vmlinuz; do
+        [[ -r ${kver} ]] || continue
+        k="${kver}"
+    done
+    if [[ -n ${k} ]]; then
+        kver=$(basename "$(dirname "${k}")")
+        export SUPERMIN_KERNEL="${k}"
+        export SUPERMIN_MODULES="$(dirname "${k}")"
+        export SUPERMIN_KERNEL_VERSION="${kver}"
+        echo "guestfish: using ${k}"
+        return 0
+    fi
+
+    dest="${PWD}/guestfs-kernel"
+    mkdir -p "${dest}/boot"
+
+    kver=$(uname -r)
+    if [[ ! -d /lib/modules/${kver} ]]; then
+        kver=""
+        for k in /lib/modules/*; do
+            [[ -d ${k}/kernel || -e ${k}/modules.dep ]] || continue
+            kver=$(basename "${k}")
+        done
+    fi
+    if [[ -z ${kver} ]]; then
+        echo "error: guestfish needs host kernel modules under /lib/modules" >&2
+        echo "Install a linux-image package, or set SUPERMIN_KERNEL and SUPERMIN_MODULES" >&2
+        return 1
+    fi
+
+    k="${dest}/boot/vmlinuz-${kver}"
+    if [[ -r ${k} ]]; then
+        export SUPERMIN_KERNEL="${k}"
+        export SUPERMIN_MODULES="/lib/modules/${kver}"
+        export SUPERMIN_KERNEL_VERSION="${kver}"
+        echo "guestfish: using extracted ${k}"
+        return 0
+    fi
+
+    pkg="linux-image-${kver}"
+    deb="${dest}/${pkg}.deb"
+    if [[ ! -f ${deb} ]]; then
+        for uri in /var/cache/apt/archives/${pkg}_*.deb; do
+            if [[ -r ${uri} ]]; then
+                cp "${uri}" "${deb}"
+                break
+            fi
+        done
+    fi
+    if [[ ! -f ${deb} ]]; then
+        if ! command -v apt-get >/dev/null 2>&1; then
+            echo "error: guestfish needs ${pkg} to extract a readable vmlinuz (apt-get not found)" >&2
+            echo "Set SUPERMIN_KERNEL to a readable kernel, or install ${pkg}" >&2
+            return 1
+        fi
+        uris=$(apt-get download --print-uris "${pkg}" 2>/dev/null) || true
+        uri=$(awk -F"'" '{print $2; exit}' <<< "${uris}")
+        if [[ -z ${uri} ]]; then
+            echo "error: could not resolve a download URL for ${pkg}" >&2
+            echo "Set SUPERMIN_KERNEL to a readable kernel, or install ${pkg} and retry" >&2
+            return 1
+        fi
+        echo "guestfish: downloading ${pkg} to extract a readable vmlinuz"
+        if ! download "${uri}" "${deb}"; then
+            echo "error: failed to download ${pkg}" >&2
+            return 1
+        fi
+    fi
+
+    if ! command -v dpkg-deb >/dev/null 2>&1; then
+        echo "error: dpkg-deb is required to extract vmlinuz from ${pkg}" >&2
+        return 1
+    fi
+    if ! dpkg-deb -x "${deb}" "${dest}"; then
+        echo "error: failed to extract ${deb}" >&2
+        return 1
+    fi
+    if [[ ! -r ${k} ]]; then
+        echo "error: ${pkg} did not contain a readable ${k#${dest}/}" >&2
+        return 1
+    fi
+
+    export SUPERMIN_KERNEL="${k}"
+    export SUPERMIN_MODULES="/lib/modules/${kver}"
+    export SUPERMIN_KERNEL_VERSION="${kver}"
+    echo "guestfish: using extracted ${k}"
+    return 0
 }
 
 # True when PATH entry is a ccache wrapper (often /usr/lib/ccache/gcc -> ccache).
