@@ -22,7 +22,7 @@
 #   - build-essential
 #   - bison
 #   - flex
-#   - guestfs-tools for SD image creation
+#   - dosfstools, mtools and e2fsprogs for SD image creation
 #   - u-boot-tools
 #   - python3-setuptools
 #   - python3-dev
@@ -34,9 +34,10 @@
 #   - git
 #   - openssl
 #
-# This script uses guestfs tools to create an SD card image and does not
-# invoke sudo. guestfish needs a readable host kernel in /boot (Ubuntu
-# often ships vmlinuz as 0600) and is faster if you are in group kvm.
+# The SD card image is assembled with mkfs.vfat/mcopy from
+# agilex5_image.cfg (64M FAT type 0xc bootable, ext4 type 0x83). The
+# DOS partition table is written in-process. No guestfish, sfdisk, or
+# root privileges. Partition 1 starts at 1MiB.
 #
 # =============================================================================
 
@@ -114,19 +115,24 @@ declare -r SZ_GB=$((${SZ_MB}*${SZ_KB}))
 declare -r SDIMG="sdcard_agilex5.img"
 declare -r SDCARD_IMG_SIZE=$((4*SZ_GB))
 declare -r RFS_PART_SIZE=$((3*${SZ_GB}))
-declare -r BOOT_PART_SIZE=$((200*${SZ_MB}))
+# agilex5_image.cfg: image boot.vfat { size = 64M }
+declare -r BOOT_PART_SIZE=$((64*${SZ_MB}))
+declare -r IMAGE_CFG="agilex5_image.cfg"
 
 # =============================================================================
 # HELPERS AND FUNCTIONS
 # =============================================================================
 
-# Same layout the original guestfish script used. A type-c bootable
-# partition at sector 1 (Buildroot's genimage layout) does not boot
-# with this SPL; partition 1 at 2048 with type 83 does.
+# Layout from agilex5_image.cfg. genimage's empty hdimage aligns to 1MiB
+# (sector 2048). Type 0xc bootable FAT, type 0x83 rootfs.
 declare -r BOOT_PART_SECTOR_START=2048
-declare -r BOOT_PART_SECTOR_END=$(( (${BOOT_PART_SIZE} / 512 ) + ${BOOT_PART_SECTOR_START}))
-declare -r RFS_PART_SECTOR_START=$((${BOOT_PART_SECTOR_END} + 1))
-declare -r RFS_PART_SECTOR_END=$(( (${RFS_PART_SIZE} / 512 ) + ${RFS_PART_SECTOR_START})) 
+declare -r BOOT_PART_SECTORS=$(( ${BOOT_PART_SIZE} / 512 ))
+declare -r RFS_PART_SECTOR_START=$(( ${BOOT_PART_SECTOR_START} + ${BOOT_PART_SECTORS} ))
+declare -r RFS_PART_SECTORS=$(( ${RFS_PART_SIZE} / 512 ))
+# FAT BPB geometry guestfish wrote for a 4G image; SPL's fat_set_blk_dev
+# rejected mkfs.vfat's default 16/32 heads/spt.
+declare -r FAT_BPB_HEADS=133
+declare -r FAT_BPB_SPT=62 
 
 # abs paths to files, handy later
 declare _DEBIAN_SHADOW_FILE="$(readlink -f ${DEBIAN_SHADOW_FILE})"
@@ -260,33 +266,127 @@ function write_root_shadow() {
     return 0
 }
 
-# guestfish/supermin boots a small appliance from /boot/vmlinuz-*. Ubuntu
-# packages that file as 0600, which makes supermin fail. Prefer the running
-# kernel if it is readable, otherwise the newest readable installed kernel.
-function setup_guestfish_kernel() {
+# rootfs_has <ext4 image> <path>: succeeds when <path> exists in the image
+function rootfs_has() {
 
-    local k
-    local kver
+    debugfs -R "stat \"${2}\"" "${1}" 2>/dev/null | grep -q '^Inode:'
+}
 
-    if [[ -r "/boot/vmlinuz-$(uname -r)" && -d "/lib/modules/$(uname -r)" ]]; then
+# rootfs_tree_cmds <host dir> <image dir>: prints the debugfs commands that
+# copy the content of <host dir> into the existing <image dir>
+function rootfs_tree_cmds() {
+
+    local src="${1}"
+    local dst="${2}"
+    local type
+    local path
+
+    (cd "${src}" && find . -mindepth 1 -printf '%y %P\n') | while read -r type path ; do
+        case "${type}" in
+            d) echo "mkdir \"${dst}/${path}\"" ;;
+            f) echo "write \"${src}/${path}\" \"${dst}/${path}\"" ;;
+            l) echo "symlink \"${dst}/${path}\" \"$(readlink "${src}/${path}")\"" ;;
+            *) echo "${FUNCNAME}: error: unsupported file type: ${src}/${path}" >&2
+               return 1 ;;
+        esac
+    done
+}
+
+# Write a DOS MBR: the 440-byte bootstrap used by guestfish/parted, a
+# disk signature, and up to four partitions. Each partition is
+# start,size,type,bootable (type may be 0xNN).
+function write_dos_mbr() {
+
+    python3 - "$@" <<'PY'
+import os
+import struct
+import sys
+
+# Guestfish/parted bootstrap; images that boot on this SPL have it.
+BOOTSTRAP = bytes.fromhex(
+    "fab800108ed0bc00b0b800008ed88ec0fbbe007cbf0006b90002f3a4ea21060000"
+    "bebe073804750b83c61081fefe0775f3eb16b402b001bb007cb2808a74018b4c02"
+    "cd13ea007c0000ebfe"
+).ljust(440, b"\x00")
+
+# 255 heads, 63 spt. Overflow CHS matches parted (fe c2 ff).
+HEADS = 255
+SPT = 63
+CHS_LIMIT = 1024 * HEADS * SPT
+
+
+def pack_chs(lba):
+    if lba >= CHS_LIMIT:
+        c, h, s = 1023, 254, 2
+    else:
+        c = lba // (HEADS * SPT)
+        rem = lba % (HEADS * SPT)
+        h = rem // SPT
+        s = rem % SPT + 1
+    return bytes((h & 0xFF, (s & 0x3F) | ((c >> 2) & 0xC0), c & 0xFF))
+
+
+def pack_part(start, size, ptype, bootable):
+    last = start + size - 1
+    return struct.pack(
+        "<B3sB3sII",
+        0x80 if bootable else 0x00,
+        pack_chs(start),
+        ptype,
+        pack_chs(last),
+        start,
+        size,
+    )
+
+
+path = sys.argv[1]
+args = sys.argv[2:]
+if len(args) % 4 != 0 or not 1 <= len(args) // 4 <= 4:
+    sys.exit("write_dos_mbr: expected 1-4 partitions as start size type bootable")
+
+table = bytearray()
+for i in range(0, len(args), 4):
+    start = int(args[i], 0)
+    size = int(args[i + 1], 0)
+    ptype = int(args[i + 2], 0)
+    bootable = int(args[i + 3], 0)
+    table += pack_part(start, size, ptype, bootable)
+table += b"\x00" * (64 - len(table))
+
+with open(path, "r+b") as f:
+    f.write(BOOTSTRAP)
+    f.write(os.urandom(4))
+    f.write(b"\x00\x00")
+    f.write(table)
+    f.write(b"\x55\xaa")
+PY
+}
+
+# Debian 13 ext4 enables orphan_file (compat feature bit 12). Host e2fsck
+# 1.46.x does not know that feature and exits 8.
+function e2fsck_rootfs() {
+
+    local img="${1}"
+    local log
+    local st
+
+    log=$(mktemp)
+    set +e
+    e2fsck -fy "${img}" >"${log}" 2>&1
+    st=$?
+    set -e
+    if [[ ${st} -le 1 ]]; then
+        rm -f "${log}"
         return 0
     fi
-
-    for k in $(ls -1 /boot/vmlinuz-* 2>/dev/null | sort -V -r); do
-        if [[ -r "${k}" ]]; then
-            kver="${k#/boot/vmlinuz-}"
-            if [[ -d "/lib/modules/${kver}" ]]; then
-                export SUPERMIN_KERNEL="${k}"
-                export SUPERMIN_MODULES="/lib/modules/${kver}"
-                echo "guestfish: using readable kernel ${k}"
-                return 0
-            fi
-        fi
-    done
-
-    echo "error: guestfish needs a readable /boot/vmlinuz-* (Ubuntu often installs them as 0600)" >&2
-    echo "Make one readable, for example: chmod a+r /boot/vmlinuz-$(uname -r)" >&2
-    return 1
+    if grep -q 'unsupported feature' "${log}"; then
+        echo "warning: host e2fsck is too old for this Debian ext4 image; skipping fsck" >&2
+        rm -f "${log}"
+        return 0
+    fi
+    cat "${log}" >&2
+    rm -f "${log}"
+    return "${st}"
 }
 
 # =============================================================================
@@ -488,7 +588,6 @@ echo "[STEP] Building Linux kernel..."
 
 rm -rf ${LINUX_LM_DIR} && mkdir ${LINUX_LM_DIR}
 _LINUX_LM_DIR_ABS="$(readlink -f ${LINUX_LM_DIR})"
-_LINUX_LM_TAR="${PWD}/linux-modules.tar"
 
 if [[ ! -d "${LINUX_DIR}" ]]; then
     clone_and_checkout "${LINUX_REPO}" "${LINUX_REF}" "${LINUX_DIR}"
@@ -516,7 +615,6 @@ cd ${_LINUX_LM_DIR_ABS}
 mkdir -p usr
 rm -rf usr/lib
 mv lib usr/lib
-tar cf ${_LINUX_LM_TAR} usr/lib/modules
 
 cd ..
 
@@ -680,39 +778,78 @@ if ! write_root_shadow ; then
     exit 1
 fi
 
-if ! setup_guestfish_kernel ; then
+BOOT_IMG="boot.vfat"
+RFS_IMG="rootfs.ext2"
+RFS_CMDS="rootfs.debugfs"
+
+echo "Assembling ${SDIMG} from ${IMAGE_CFG}"
+
+rm -f "${SDIMG}"
+truncate -s ${SDCARD_IMG_SIZE} "${SDIMG}"
+write_dos_mbr "${SDIMG}" \
+    "${BOOT_PART_SECTOR_START}" "${BOOT_PART_SECTORS}" 0x0c 1 \
+    "${RFS_PART_SECTOR_START}" "${RFS_PART_SECTORS}" 0x83 0
+
+# 64M FAT, files from agilex5_image.cfg plus kernel.itb and boot.scr.uimg
+# for the debian FIT boot script.
+rm -f "${BOOT_IMG}"
+truncate -s ${BOOT_PART_SIZE} "${BOOT_IMG}"
+mkfs.vfat -I --mbr=n -F 16 -h ${BOOT_PART_SECTOR_START} \
+    -g ${FAT_BPB_HEADS}/${FAT_BPB_SPT} "${BOOT_IMG}" >/dev/null
+MTOOLS_SKIP_CHECK=1 mcopy -i "${BOOT_IMG}" \
+    "${LINUX_DIR}/arch/arm64/boot/Image" \
+    "${LINUX_DIR}/arch/arm64/boot/dts/${LINUX_DTB}" \
+    "${UBOOT_DIR}/u-boot.itb" \
+    kernel.itb boot.scr.uimg ::/
+
+dd if="${BOOT_IMG}" of="${SDIMG}" bs=512 seek=${BOOT_PART_SECTOR_START} \
+   conv=notrunc status=none
+rm -f "${BOOT_IMG}"
+
+read -r rfs_start rfs_sectors < <(partx -g -n 1 -o START,SECTORS disk.raw)
+if [[ -z ${rfs_start} || -z ${rfs_sectors} ]]; then
+    echo "error: could not read the Debian root partition from disk.raw" >&2
+    exit 1
+fi
+if [[ ${rfs_sectors} -gt ${RFS_PART_SECTORS} ]]; then
+    echo "error: the Debian root file system does not fit in the SD card partition" >&2
+    exit 1
+fi
+dd if=disk.raw of="${RFS_IMG}" bs=4M iflag=skip_bytes,count_bytes \
+   skip=$(( ${rfs_start} * 512 )) count=$(( ${rfs_sectors} * 512 )) conv=sparse status=none
+
+shadow_gid=$(debugfs -R "stat /etc/shadow" "${RFS_IMG}" 2>/dev/null | sed -n 's/.*Group: *\([0-9]*\).*/\1/p')
+
+{
+    echo "rm /etc/shadow"
+    echo "write \"${_DEBIAN_SHADOW_FILE}\" /etc/shadow"
+    echo "sif /etc/shadow mode 0100640"
+    echo "sif /etc/shadow gid ${shadow_gid:-0}"
+    echo "rm /etc/fstab"
+    echo "write \"${_DEBIAN_FSTAB_FILE}\" /etc/fstab"
+    echo "sif /etc/fstab mode 0100644"
+    rootfs_tree_cmds "${_LINUX_LM_DIR_ABS}/usr/lib/modules" /usr/lib/modules
+    if rootfs_has "${RFS_IMG}" /init ; then
+        echo "rm /init"
+    fi
+    echo "symlink /init sbin/init"
+} > "${RFS_CMDS}"
+
+debugfs -w -f "${RFS_CMDS}" "${RFS_IMG}" >/dev/null 2>&1
+
+if ! e2fsck_rootfs "${RFS_IMG}" ; then
     exit 1
 fi
 
-# Guestfish formats the FAT partition in-place. Recreating that with
-# sfdisk/mkfs.vfat produced a matching partition table that SPL still
-# rejected (fat register err -1).
-guestfish --ro -a disk.raw <<EOF
-sparse ${SDIMG} ${SDCARD_IMG_SIZE}
-run
-part-init /dev/sdb mbr
-part-add /dev/sdb p ${BOOT_PART_SECTOR_START} ${BOOT_PART_SECTOR_END}
-part-add /dev/sdb p ${RFS_PART_SECTOR_START}  ${RFS_PART_SECTOR_END}
-mkfs fat /dev/sdb1
-mount /dev/sdb1 /
-copy-in ${PWD}/${UBOOT_DIR}/u-boot.itb /
-copy-in ${PWD}/kernel.itb /
-copy-in ${PWD}/boot.scr.uimg /
-unmount /
-copy-device-to-device /dev/sda1 /dev/sdb2
-mount /dev/sdb2 /
-upload ${_DEBIAN_SHADOW_FILE} /etc/shadow
-chmod 0640 /etc/shadow
-upload ${_DEBIAN_FSTAB_FILE} /etc/fstab
-tar-in ${_LINUX_LM_TAR} /
-ln-sf sbin/init /init
-sync
-EOF
-
-if [[ $? -ne 0 ]]; then
-    echo "ERROR: Failed to create SD card image"
+if ! rootfs_has "${RFS_IMG}" /init ; then
+    echo "ERROR: Failed to update the root file system" >&2
     exit 1
 fi
+
+dd if="${RFS_IMG}" of="${SDIMG}" bs=4M oflag=seek_bytes \
+   seek=$(( ${RFS_PART_SECTOR_START} * 512 )) conv=notrunc,sparse status=none
+
+rm -f "${RFS_IMG}" "${RFS_CMDS}"
 
 cat <<EOS
 
