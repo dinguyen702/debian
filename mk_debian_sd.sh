@@ -76,6 +76,9 @@ declare -r UBOOT_DTSI="arch/arm/dts/socfpga_agilex5_socdk-u-boot.dtsi"
 declare -r LINUX_DTB="intel/socfpga_agilex5_socdk.dtb"
 declare -r LINUX_DTB_NAME="socfpga_agilex5_socdk.dtb"
 declare -r KERNEL_LOAD="0x90000000"
+# Agilex 5 U-Boot env defaults (CONFIG_SYS_LOAD_ADDR / fdt_addr_r)
+declare -r UBOOT_LOADADDR="0x82000000"
+declare -r UBOOT_FDTADDR="0x86000000"
 
 declare -r DEF_UBOOT_ITS_FILE="uboot_script.its"
 declare -r DEF_UBOOT_ITS_URL="https://raw.githubusercontent.com/altera-fpga/meta-altera-fpga/whinlatter/meta-altera-bsp/recipes-bsp/u-boot/bootscr/${DEF_UBOOT_ITS_FILE}"
@@ -364,6 +367,38 @@ function e2fsck_rootfs() {
     return "${st}"
 }
 
+# Write uboot.txt: load kernel.itb (FIT) from FAT partition 1, then fall
+# back to Image + DTB. Addresses match socfpga_agilex5_defconfig.
+function write_uboot_script() {
+
+    cat > "${UBOOT_SCRIPT_FILE}" <<EOF
+if test -z "\${board_id}"; then setenv board_id ${BOARD_ID}; fi
+if test -z "\${loadaddr}"; then setenv loadaddr ${UBOOT_LOADADDR}; fi
+if test -z "\${kernel_addr_r}"; then setenv kernel_addr_r ${UBOOT_LOADADDR}; fi
+if test -z "\${fdt_addr_r}"; then setenv fdt_addr_r ${UBOOT_FDTADDR}; fi
+
+mmc rescan
+fatls mmc 0:1
+
+if test -z "\${bootargs}"; then
+	setenv bootargs "earlycon panic=-1 root=/dev/mmcblk0p2 rw rootwait"
+fi
+
+if test -e mmc 0:1 kernel.itb; then
+	echo "Loading kernel.itb from mmc 0:1"
+	fatload mmc 0:1 \${loadaddr} kernel.itb
+	bootm \${loadaddr}#board-\${board_id}
+fi
+
+if test -e mmc 0:1 Image; then
+	echo "Loading Image and ${LINUX_DTB_NAME} from mmc 0:1"
+	fatload mmc 0:1 \${kernel_addr_r} Image
+	fatload mmc 0:1 \${fdt_addr_r} ${LINUX_DTB_NAME}
+	booti \${kernel_addr_r} - \${fdt_addr_r}
+fi
+EOF
+}
+
 # True when PATH entry is a ccache wrapper (often /usr/lib/ccache/gcc -> ccache).
 # Using that as HOSTCC makes make pass -W... to ccache, which errors.
 function cc_is_ccache() {
@@ -602,27 +637,13 @@ echo "U-Boot build complete"
 # =============================================================================
 echo "[STEP] Getting uboot script ..."
 
-# get the updated uboot_script.its everytime
 rm -f "${UBOOT_ITS_FILE}"
 if ! download "${UBOOT_ITS_URL}" "${UBOOT_ITS_FILE}" ; then
-	echo "error: failed to dowbload ${UBOOT_ITS_FILE}"
+	echo "error: failed to download ${UBOOT_ITS_FILE}"
 	exit 3
 fi
 
-# get the updated uboot.txt everytime
-rm -f "${UBOOT_SCRIPT_FILE}"
-if ! download "${UBOOT_SCRIPT_URL}" "${UBOOT_SCRIPT_FILE}" ; then
-	echo "error: failed to dowbload ${UBOOT_SCRIPT_FILE}"
-	exit 3
-fi
-
-# The Altera script does bootm ${loadaddr}#board-${board_id}. Set a
-# default when the environment does not already have one.
-{
-	echo "if test -z \"\${board_id}\"; then setenv board_id ${BOARD_ID}; fi"
-	cat "${UBOOT_SCRIPT_FILE}"
-} > "${UBOOT_SCRIPT_FILE}.new"
-mv "${UBOOT_SCRIPT_FILE}.new" "${UBOOT_SCRIPT_FILE}"
+write_uboot_script
 
 mkimage -f "${UBOOT_ITS_FILE}" boot.scr.uimg
 
@@ -850,7 +871,9 @@ truncate -s $(( ${BOOT_PART_SECTORS} * 512 )) "${BOOT_IMG}"
 mkfs.vfat -I --mbr=n -F 16 -h ${BOOT_PART_SECTOR_START} \
     -g ${FAT_BPB_HEADS}/${FAT_BPB_SPT} "${BOOT_IMG}" >/dev/null
 MTOOLS_SKIP_CHECK=1 mcopy -i "${BOOT_IMG}" \
-    "${UBOOT_DIR}/u-boot.itb" kernel.itb boot.scr.uimg ::/
+    "${UBOOT_DIR}/u-boot.itb" kernel.itb boot.scr.uimg \
+    "${LINUX_DIR}/arch/arm64/boot/Image" \
+    "${LINUX_DIR}/arch/arm64/boot/dts/${LINUX_DTB}" ::/
 dd if="${BOOT_IMG}" of="${SDIMG}" bs=512 seek=${BOOT_PART_SECTOR_START} \
    conv=notrunc status=none
 rm -f "${BOOT_IMG}"
@@ -942,6 +965,23 @@ Boot from the SD card:
            -o hps=1
   4. Program the JIC and power cycle the board:
        quartus_pgm -c 1 -m jtag -o "pvi;output_file.jic"
+
+U-Boot prompt, load from FAT partition 1 (FIT):
+  mmc rescan
+  fatls mmc 0:1
+  setenv bootargs earlycon panic=-1 root=/dev/mmcblk0p2 rw rootwait
+  fatload mmc 0:1 \${loadaddr} kernel.itb
+  bootm \${loadaddr}#board-${BOARD_ID}
+
+U-Boot prompt, load Image and DTB from partition 1:
+  mmc rescan
+  fatload mmc 0:1 \${kernel_addr_r} Image
+  fatload mmc 0:1 \${fdt_addr_r} ${LINUX_DTB_NAME}
+  setenv bootargs earlycon panic=-1 root=/dev/mmcblk0p2 rw rootwait
+  booti \${kernel_addr_r} - \${fdt_addr_r}
+
+  loadaddr / kernel_addr_r = ${UBOOT_LOADADDR}
+  fdt_addr_r              = ${UBOOT_FDTADDR}
 
 Login:
   user:     ${DEBIAN_USER}
