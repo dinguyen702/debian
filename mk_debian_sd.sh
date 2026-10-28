@@ -35,10 +35,11 @@
 #   - openssl
 #
 # The SD card image is assembled from regular files, so no root
-# privileges are needed to run this script. The FAT boot partition is
-# formatted to match the BPB guestfish produced (spt 62, heads 133,
-# hidden sectors = partition start); SPL rejected mkfs.vfat's default
-# geometry even with the same partition table.
+# privileges are needed to run this script. Partition 1 is formatted
+# in place as FAT16 with the BPB guestfish produced (spt 62, heads
+# 133, hidden sectors = partition start) and the parted MBR bootstrap
+# sfdisk no longer writes. SPL rejected a copied FAT with mkfs.vfat's
+# default geometry (fat register err -1).
 #
 # =============================================================================
 
@@ -290,6 +291,50 @@ function rootfs_tree_cmds() {
                return 1 ;;
         esac
     done
+}
+
+# util-linux sfdisk 2.39 zeros MBR bytes 0-439. Guestfish/parted write this
+# bootstrap; every SD image that boots on this SPL has it. SPL does not
+# execute it (ARM), but part_test_dos is happier with a real DOS MBR.
+# Same 62 bytes GNU parted uses, then zeros to 440.
+function install_mbr_bootstrap() {
+
+    python3 - "${1}" <<'PY'
+import sys
+
+path = sys.argv[1]
+boot = bytes.fromhex(
+    "fab800108ed0bc00b0b800008ed88ec0fbbe007cbf0006b90002f3a4ea21060000"
+    "bebe073804750b83c61081fefe0775f3eb16b402b001bb007cb2808a74018b4c02"
+    "cd13ea007c0000ebfe"
+).ljust(440, b"\x00")
+with open(path, "r+b") as f:
+    f.write(boot)
+PY
+}
+
+# Confirm the SPL checks in fat_set_blk_dev: 55AA and a "FAT" type string
+# on partition 1. $1 = image, $2 = partition start in 512-byte sectors.
+function verify_spl_fat() {
+
+    python3 - "${1}" "${2}" <<'PY'
+import sys
+
+img, start = sys.argv[1], int(sys.argv[2])
+with open(img, "rb") as f:
+    mbr = f.read(512)
+    f.seek(start * 512)
+    fat = f.read(512)
+if mbr[510:512] != b"\x55\xaa":
+    print("error: MBR missing 55AA signature", file=sys.stderr)
+    sys.exit(1)
+if fat[510:512] != b"\x55\xaa":
+    print("error: FAT boot sector missing 55AA", file=sys.stderr)
+    sys.exit(1)
+if fat[0x36:0x39] != b"FAT" and fat[0x52:0x57] != b"FAT32":
+    print("error: partition 1 is not a FAT volume; SPL will report fat register err -1", file=sys.stderr)
+    sys.exit(1)
+PY
 }
 
 # True when PATH entry is a ccache wrapper (often /usr/lib/ccache/gcc -> ccache).
@@ -754,11 +799,11 @@ if ! write_root_shadow ; then
     exit 1
 fi
 
-BOOT_IMG="boot.vfat"
 RFS_IMG="rootfs.ext4"
 RFS_CMDS="rootfs.debugfs"
 BOOT_PART_SECTORS=$(( ${BOOT_PART_SECTOR_END} - ${BOOT_PART_SECTOR_START} + 1 ))
 RFS_PART_SECTORS=$(( ${RFS_PART_SECTOR_END} - ${RFS_PART_SECTOR_START} + 1 ))
+BOOT_FAT_OFFSET=$(( ${BOOT_PART_SECTOR_START} * 512 ))
 
 rm -f "${SDIMG}"
 truncate -s ${SDCARD_IMG_SIZE} "${SDIMG}"
@@ -768,17 +813,21 @@ unit: sectors
 start=${BOOT_PART_SECTOR_START}, size=${BOOT_PART_SECTORS}, type=83
 start=${RFS_PART_SECTOR_START}, size=${RFS_PART_SECTORS}, type=83
 EOF
+install_mbr_bootstrap "${SDIMG}"
 
-# Format the FAT the same way guestfish did on this 4G image: FAT16,
-# hidden sectors = partition start, geometry 133/62. SPL rejected a
-# FAT with mkfs.vfat's default 16/32 geometry (fat register err -1)
-# even when the partition table matched.
-rm -f "${BOOT_IMG}"
-truncate -s $(( ${BOOT_PART_SECTORS} * 512 )) "${BOOT_IMG}"
-mkfs.vfat -I -F 16 -h ${BOOT_PART_SECTOR_START} \
-    -g ${FAT_BPB_HEADS}/${FAT_BPB_SPT} "${BOOT_IMG}" >/dev/null
-MTOOLS_SKIP_CHECK=1 mcopy -i "${BOOT_IMG}" \
+# Format partition 1 in place, like guestfish mkfs fat on the 4G disk:
+# FAT16, hidden = start, geometry 133/62. --mbr=n keeps sfdisk's table.
+# mkfs.vfat BLOCKS is KiB so the odd 409601-sector length is truncated
+# by one sector; guestfish's tot32 is already slightly smaller (409572).
+mkfs.vfat -I --mbr=n -F 16 -h ${BOOT_PART_SECTOR_START} \
+    -g ${FAT_BPB_HEADS}/${FAT_BPB_SPT} --offset=${BOOT_PART_SECTOR_START} \
+    "${SDIMG}" $(( ${BOOT_PART_SECTORS} / 2 )) >/dev/null
+MTOOLS_SKIP_CHECK=1 mcopy -i "${SDIMG}@@${BOOT_FAT_OFFSET}" \
     "${UBOOT_DIR}/u-boot.itb" kernel.itb boot.scr.uimg ::/
+
+if ! verify_spl_fat "${SDIMG}" ${BOOT_PART_SECTOR_START} ; then
+    exit 1
+fi
 
 # Root file system, extracted from the first partition of disk.raw
 read -r rfs_start rfs_sectors < <(partx -g -n 1 -o START,SECTORS disk.raw)
@@ -820,12 +869,10 @@ if ! rootfs_has "${RFS_IMG}" /init ; then
     exit 1
 fi
 
-dd if="${BOOT_IMG}" of="${SDIMG}" bs=512 seek=${BOOT_PART_SECTOR_START} \
-   conv=notrunc status=none
 dd if="${RFS_IMG}" of="${SDIMG}" bs=4M oflag=seek_bytes \
    seek=$(( ${RFS_PART_SECTOR_START} * 512 )) conv=notrunc,sparse status=none
 
-rm -f "${BOOT_IMG}" "${RFS_IMG}" "${RFS_CMDS}"
+rm -f "${RFS_IMG}" "${RFS_CMDS}"
 
 cat <<EOS
 
