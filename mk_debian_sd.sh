@@ -35,11 +35,11 @@
 #   - openssl
 #
 # The SD card image is assembled from regular files, so no root
-# privileges are needed to run this script. Partition 1 is formatted
-# in place as FAT16 with the BPB guestfish produced (spt 62, heads
-# 133, hidden sectors = partition start) and the parted MBR bootstrap
-# sfdisk no longer writes. SPL rejected a copied FAT with mkfs.vfat's
-# default geometry (fat register err -1).
+# privileges are needed to run this script. Partition 1 is FAT16 with
+# the BPB guestfish produced (spt 62, heads 133, hidden sectors =
+# partition start) and the parted MBR bootstrap sfdisk no longer
+# writes. SPL rejected a FAT with mkfs.vfat's default geometry
+# (fat register err -1).
 #
 # =============================================================================
 
@@ -335,6 +335,33 @@ if fat[0x36:0x39] != b"FAT" and fat[0x52:0x57] != b"FAT32":
     print("error: partition 1 is not a FAT volume; SPL will report fat register err -1", file=sys.stderr)
     sys.exit(1)
 PY
+}
+
+# Debian 13 ext4 enables orphan_file (compat feature bit 12). Host e2fsck
+# 1.46.x (Ubuntu 22.04) does not know that feature and exits 8.
+function e2fsck_rootfs() {
+
+    local img="${1}"
+    local log
+    local st
+
+    log=$(mktemp)
+    set +e
+    e2fsck -fy "${img}" >"${log}" 2>&1
+    st=$?
+    set -e
+    if [[ ${st} -le 1 ]]; then
+        rm -f "${log}"
+        return 0
+    fi
+    if grep -q 'unsupported feature' "${log}"; then
+        echo "warning: host e2fsck is too old for this Debian ext4 image; skipping fsck" >&2
+        rm -f "${log}"
+        return 0
+    fi
+    cat "${log}" >&2
+    rm -f "${log}"
+    return "${st}"
 }
 
 # True when PATH entry is a ccache wrapper (often /usr/lib/ccache/gcc -> ccache).
@@ -803,7 +830,6 @@ RFS_IMG="rootfs.ext4"
 RFS_CMDS="rootfs.debugfs"
 BOOT_PART_SECTORS=$(( ${BOOT_PART_SECTOR_END} - ${BOOT_PART_SECTOR_START} + 1 ))
 RFS_PART_SECTORS=$(( ${RFS_PART_SECTOR_END} - ${RFS_PART_SECTOR_START} + 1 ))
-BOOT_FAT_OFFSET=$(( ${BOOT_PART_SECTOR_START} * 512 ))
 
 rm -f "${SDIMG}"
 truncate -s ${SDCARD_IMG_SIZE} "${SDIMG}"
@@ -815,15 +841,19 @@ start=${RFS_PART_SECTOR_START}, size=${RFS_PART_SECTORS}, type=83
 EOF
 install_mbr_bootstrap "${SDIMG}"
 
-# Format partition 1 in place, like guestfish mkfs fat on the 4G disk:
-# FAT16, hidden = start, geometry 133/62. --mbr=n keeps sfdisk's table.
-# mkfs.vfat BLOCKS is KiB so the odd 409601-sector length is truncated
-# by one sector; guestfish's tot32 is already slightly smaller (409572).
+# FAT16 with the guestfish BPB (hidden = start, geometry 133/62). Format a
+# file the size of the partition so mkfs.vfat does not see the rest of the
+# 4G image and warn about a block-count mismatch, then copy it in.
+BOOT_IMG="boot.vfat"
+rm -f "${BOOT_IMG}"
+truncate -s $(( ${BOOT_PART_SECTORS} * 512 )) "${BOOT_IMG}"
 mkfs.vfat -I --mbr=n -F 16 -h ${BOOT_PART_SECTOR_START} \
-    -g ${FAT_BPB_HEADS}/${FAT_BPB_SPT} --offset=${BOOT_PART_SECTOR_START} \
-    "${SDIMG}" $(( ${BOOT_PART_SECTORS} / 2 )) >/dev/null
-MTOOLS_SKIP_CHECK=1 mcopy -i "${SDIMG}@@${BOOT_FAT_OFFSET}" \
+    -g ${FAT_BPB_HEADS}/${FAT_BPB_SPT} "${BOOT_IMG}" >/dev/null
+MTOOLS_SKIP_CHECK=1 mcopy -i "${BOOT_IMG}" \
     "${UBOOT_DIR}/u-boot.itb" kernel.itb boot.scr.uimg ::/
+dd if="${BOOT_IMG}" of="${SDIMG}" bs=512 seek=${BOOT_PART_SECTOR_START} \
+   conv=notrunc status=none
+rm -f "${BOOT_IMG}"
 
 if ! verify_spl_fat "${SDIMG}" ${BOOT_PART_SECTOR_START} ; then
     exit 1
@@ -859,10 +889,11 @@ shadow_gid=$(debugfs -R "stat /etc/shadow" "${RFS_IMG}" 2>/dev/null | sed -n 's/
     echo "symlink /init sbin/init"
 } > "${RFS_CMDS}"
 
-debugfs -w -f "${RFS_CMDS}" "${RFS_IMG}" >/dev/null
+debugfs -w -f "${RFS_CMDS}" "${RFS_IMG}" >/dev/null 2>&1
 
-# e2fsck returns 1 when it fixed something, which is fine
-e2fsck -fy "${RFS_IMG}" >/dev/null || [[ $? -le 1 ]]
+if ! e2fsck_rootfs "${RFS_IMG}" ; then
+    exit 1
+fi
 
 if ! rootfs_has "${RFS_IMG}" /init ; then
     echo "ERROR: Failed to update the root file system" >&2
