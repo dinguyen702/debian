@@ -22,7 +22,7 @@
 #   - gcc (or cc) and g++ for host tools
 #   - bison
 #   - flex
-#   - guestfs-tools for SD image creation
+#   - fdisk (sfdisk), dosfstools, mtools and e2fsprogs for SD image creation
 #   - u-boot-tools
 #   - python3-setuptools
 #   - python3-dev
@@ -34,12 +34,11 @@
 #   - git
 #   - openssl
 #
-# This script uses guestfs tools to create an SD card image and does not
-# invoke sudo. guestfish/supermin boots a qemu appliance with a host
-# kernel; Ubuntu's /boot/vmlinuz-* is often 0600, so this script does
-# not read /boot. It uses /lib/modules/*/vmlinuz when that exists, or
-# extracts vmlinuz from the linux-image .deb into the build directory.
-# It is faster if you are in group kvm.
+# The SD card image is assembled from regular files, so no root
+# privileges are needed to run this script. The FAT boot partition is
+# formatted to match the BPB guestfish produced (spt 62, heads 133,
+# hidden sectors = partition start); SPL rejected mkfs.vfat's default
+# geometry even with the same partition table.
 #
 # =============================================================================
 
@@ -129,7 +128,11 @@ declare -r BOOT_PART_SIZE=$((200*${SZ_MB}))
 declare -r BOOT_PART_SECTOR_START=2048
 declare -r BOOT_PART_SECTOR_END=$(( (${BOOT_PART_SIZE} / 512 ) + ${BOOT_PART_SECTOR_START}))
 declare -r RFS_PART_SECTOR_START=$((${BOOT_PART_SECTOR_END} + 1))
-declare -r RFS_PART_SECTOR_END=$(( (${RFS_PART_SIZE} / 512 ) + ${RFS_PART_SECTOR_START})) 
+declare -r RFS_PART_SECTOR_END=$(( (${RFS_PART_SIZE} / 512 ) + ${RFS_PART_SECTOR_START}))
+# FAT BPB geometry guestfish writes for this 4G image. Keep in lockstep
+# with a `mkfs fat` of partition 1; SPL's fat_set_blk_dev is picky.
+declare -r FAT_BPB_HEADS=133
+declare -r FAT_BPB_SPT=62 
 
 # abs paths to files, handy later
 declare _DEBIAN_SHADOW_FILE="$(readlink -f ${DEBIAN_SHADOW_FILE})"
@@ -263,127 +266,30 @@ function write_root_shadow() {
     return 0
 }
 
-# guestfish/supermin boots a small qemu appliance. It needs a readable
-# host-arch kernel and matching modules, but not the files in /boot
-# (Ubuntu ships those as 0600). Prefer SUPERMIN_KERNEL if set, then a
-# vmlinuz next to /lib/modules, then a copy extracted from linux-image.
-function setup_guestfish_kernel() {
+# rootfs_has <ext4 image> <path>: succeeds when <path> exists in the image
+function rootfs_has() {
 
-    local k
-    local kver
-    local dest
-    local pkg
-    local deb
-    local uri
-    local uris
+    debugfs -R "stat \"${2}\"" "${1}" 2>/dev/null | grep -q '^Inode:'
+}
 
-    if [[ -n ${SUPERMIN_KERNEL:-} ]]; then
-        if [[ -r ${SUPERMIN_KERNEL} ]]; then
-            echo "guestfish: using SUPERMIN_KERNEL=${SUPERMIN_KERNEL}"
-            return 0
-        fi
-        echo "error: SUPERMIN_KERNEL=${SUPERMIN_KERNEL} is not readable" >&2
-        return 1
-    fi
+# rootfs_tree_cmds <host dir> <image dir>: prints the debugfs commands that
+# copy the content of <host dir> into the existing <image dir>
+function rootfs_tree_cmds() {
 
-    for k in /lib/modules/$(uname -r)/vmlinuz /usr/lib/modules/$(uname -r)/vmlinuz; do
-        if [[ -r ${k} ]]; then
-            export SUPERMIN_KERNEL="${k}"
-            export SUPERMIN_MODULES="$(dirname "${k}")"
-            export SUPERMIN_KERNEL_VERSION="$(uname -r)"
-            echo "guestfish: using ${k}"
-            return 0
-        fi
+    local src="${1}"
+    local dst="${2}"
+    local type
+    local path
+
+    (cd "${src}" && find . -mindepth 1 -printf '%y %P\n') | while read -r type path ; do
+        case "${type}" in
+            d) echo "mkdir \"${dst}/${path}\"" ;;
+            f) echo "write \"${src}/${path}\" \"${dst}/${path}\"" ;;
+            l) echo "symlink \"${dst}/${path}\" \"$(readlink "${src}/${path}")\"" ;;
+            *) echo "${FUNCNAME}: error: unsupported file type: ${src}/${path}" >&2
+               return 1 ;;
+        esac
     done
-
-    k=""
-    for kver in /lib/modules/*/vmlinuz /usr/lib/modules/*/vmlinuz; do
-        [[ -r ${kver} ]] || continue
-        k="${kver}"
-    done
-    if [[ -n ${k} ]]; then
-        kver=$(basename "$(dirname "${k}")")
-        export SUPERMIN_KERNEL="${k}"
-        export SUPERMIN_MODULES="$(dirname "${k}")"
-        export SUPERMIN_KERNEL_VERSION="${kver}"
-        echo "guestfish: using ${k}"
-        return 0
-    fi
-
-    dest="${PWD}/guestfs-kernel"
-    mkdir -p "${dest}/boot"
-
-    kver=$(uname -r)
-    if [[ ! -d /lib/modules/${kver} ]]; then
-        kver=""
-        for k in /lib/modules/*; do
-            [[ -d ${k}/kernel || -e ${k}/modules.dep ]] || continue
-            kver=$(basename "${k}")
-        done
-    fi
-    if [[ -z ${kver} ]]; then
-        echo "error: guestfish needs host kernel modules under /lib/modules" >&2
-        echo "Install a linux-image package, or set SUPERMIN_KERNEL and SUPERMIN_MODULES" >&2
-        return 1
-    fi
-
-    k="${dest}/boot/vmlinuz-${kver}"
-    if [[ -r ${k} ]]; then
-        export SUPERMIN_KERNEL="${k}"
-        export SUPERMIN_MODULES="/lib/modules/${kver}"
-        export SUPERMIN_KERNEL_VERSION="${kver}"
-        echo "guestfish: using extracted ${k}"
-        return 0
-    fi
-
-    pkg="linux-image-${kver}"
-    deb="${dest}/${pkg}.deb"
-    if [[ ! -f ${deb} ]]; then
-        for uri in /var/cache/apt/archives/${pkg}_*.deb; do
-            if [[ -r ${uri} ]]; then
-                cp "${uri}" "${deb}"
-                break
-            fi
-        done
-    fi
-    if [[ ! -f ${deb} ]]; then
-        if ! command -v apt-get >/dev/null 2>&1; then
-            echo "error: guestfish needs ${pkg} to extract a readable vmlinuz (apt-get not found)" >&2
-            echo "Set SUPERMIN_KERNEL to a readable kernel, or install ${pkg}" >&2
-            return 1
-        fi
-        uris=$(apt-get download --print-uris "${pkg}" 2>/dev/null) || true
-        uri=$(awk -F"'" '{print $2; exit}' <<< "${uris}")
-        if [[ -z ${uri} ]]; then
-            echo "error: could not resolve a download URL for ${pkg}" >&2
-            echo "Set SUPERMIN_KERNEL to a readable kernel, or install ${pkg} and retry" >&2
-            return 1
-        fi
-        echo "guestfish: downloading ${pkg} to extract a readable vmlinuz"
-        if ! download "${uri}" "${deb}"; then
-            echo "error: failed to download ${pkg}" >&2
-            return 1
-        fi
-    fi
-
-    if ! command -v dpkg-deb >/dev/null 2>&1; then
-        echo "error: dpkg-deb is required to extract vmlinuz from ${pkg}" >&2
-        return 1
-    fi
-    if ! dpkg-deb -x "${deb}" "${dest}"; then
-        echo "error: failed to extract ${deb}" >&2
-        return 1
-    fi
-    if [[ ! -r ${k} ]]; then
-        echo "error: ${pkg} did not contain a readable ${k#${dest}/}" >&2
-        return 1
-    fi
-
-    export SUPERMIN_KERNEL="${k}"
-    export SUPERMIN_MODULES="/lib/modules/${kver}"
-    export SUPERMIN_KERNEL_VERSION="${kver}"
-    echo "guestfish: using extracted ${k}"
-    return 0
 }
 
 # True when PATH entry is a ccache wrapper (often /usr/lib/ccache/gcc -> ccache).
@@ -658,7 +564,6 @@ echo "[STEP] Building Linux kernel..."
 
 rm -rf ${LINUX_LM_DIR} && mkdir ${LINUX_LM_DIR}
 _LINUX_LM_DIR_ABS="$(readlink -f ${LINUX_LM_DIR})"
-_LINUX_LM_TAR="${PWD}/linux-modules.tar"
 
 if [[ ! -d "${LINUX_DIR}" ]]; then
     clone_and_checkout "${LINUX_REPO}" "${LINUX_REF}" "${LINUX_DIR}"
@@ -681,12 +586,11 @@ make -j "${JOBS}" modules
 make -j "${JOBS}" modules_install INSTALL_MOD_PATH="${_LINUX_LM_DIR_ABS}"
 
 cd ${_LINUX_LM_DIR_ABS}
-# Debian merges /lib into /usr/lib. A tarball rooted at lib/ replaces that
-# symlink, which removes /lib/systemd. Place modules under usr/lib instead.
+# Debian merges /lib into /usr/lib. Copying into lib/ would replace that
+# symlink and remove /lib/systemd. Place modules under usr/lib instead.
 mkdir -p usr
 rm -rf usr/lib
 mv lib usr/lib
-tar cf ${_LINUX_LM_TAR} usr/lib/modules
 
 cd ..
 
@@ -850,39 +754,78 @@ if ! write_root_shadow ; then
     exit 1
 fi
 
-if ! setup_guestfish_kernel ; then
-    exit 1
-fi
+BOOT_IMG="boot.vfat"
+RFS_IMG="rootfs.ext4"
+RFS_CMDS="rootfs.debugfs"
+BOOT_PART_SECTORS=$(( ${BOOT_PART_SECTOR_END} - ${BOOT_PART_SECTOR_START} + 1 ))
+RFS_PART_SECTORS=$(( ${RFS_PART_SECTOR_END} - ${RFS_PART_SECTOR_START} + 1 ))
 
-# Guestfish formats the FAT partition in-place. Recreating that with
-# sfdisk/mkfs.vfat produced a matching partition table that SPL still
-# rejected (fat register err -1).
-guestfish --ro -a disk.raw <<EOF
-sparse ${SDIMG} ${SDCARD_IMG_SIZE}
-run
-part-init /dev/sdb mbr
-part-add /dev/sdb p ${BOOT_PART_SECTOR_START} ${BOOT_PART_SECTOR_END}
-part-add /dev/sdb p ${RFS_PART_SECTOR_START}  ${RFS_PART_SECTOR_END}
-mkfs fat /dev/sdb1
-mount /dev/sdb1 /
-copy-in ${PWD}/${UBOOT_DIR}/u-boot.itb /
-copy-in ${PWD}/kernel.itb /
-copy-in ${PWD}/boot.scr.uimg /
-unmount /
-copy-device-to-device /dev/sda1 /dev/sdb2
-mount /dev/sdb2 /
-upload ${_DEBIAN_SHADOW_FILE} /etc/shadow
-chmod 0640 /etc/shadow
-upload ${_DEBIAN_FSTAB_FILE} /etc/fstab
-tar-in ${_LINUX_LM_TAR} /
-ln-sf sbin/init /init
-sync
+rm -f "${SDIMG}"
+truncate -s ${SDCARD_IMG_SIZE} "${SDIMG}"
+sfdisk --quiet "${SDIMG}" <<EOF
+label: dos
+unit: sectors
+start=${BOOT_PART_SECTOR_START}, size=${BOOT_PART_SECTORS}, type=83
+start=${RFS_PART_SECTOR_START}, size=${RFS_PART_SECTORS}, type=83
 EOF
 
-if [[ $? -ne 0 ]]; then
-    echo "ERROR: Failed to create SD card image"
+# Format the FAT the same way guestfish did on this 4G image: FAT16,
+# hidden sectors = partition start, geometry 133/62. SPL rejected a
+# FAT with mkfs.vfat's default 16/32 geometry (fat register err -1)
+# even when the partition table matched.
+rm -f "${BOOT_IMG}"
+truncate -s $(( ${BOOT_PART_SECTORS} * 512 )) "${BOOT_IMG}"
+mkfs.vfat -I -F 16 -h ${BOOT_PART_SECTOR_START} \
+    -g ${FAT_BPB_HEADS}/${FAT_BPB_SPT} "${BOOT_IMG}" >/dev/null
+MTOOLS_SKIP_CHECK=1 mcopy -i "${BOOT_IMG}" \
+    "${UBOOT_DIR}/u-boot.itb" kernel.itb boot.scr.uimg ::/
+
+# Root file system, extracted from the first partition of disk.raw
+read -r rfs_start rfs_sectors < <(partx -g -n 1 -o START,SECTORS disk.raw)
+if [[ -z ${rfs_start} || -z ${rfs_sectors} ]]; then
+    echo "error: could not read the Debian root partition from disk.raw" >&2
     exit 1
 fi
+if [[ ${rfs_sectors} -gt ${RFS_PART_SECTORS} ]]; then
+    echo "error: the Debian root file system does not fit in the SD card partition" >&2
+    exit 1
+fi
+dd if=disk.raw of="${RFS_IMG}" bs=4M iflag=skip_bytes,count_bytes \
+   skip=$(( ${rfs_start} * 512 )) count=$(( ${rfs_sectors} * 512 )) conv=sparse status=none
+
+shadow_gid=$(debugfs -R "stat /etc/shadow" "${RFS_IMG}" 2>/dev/null | sed -n 's/.*Group: *\([0-9]*\).*/\1/p')
+
+{
+    echo "rm /etc/shadow"
+    echo "write \"${_DEBIAN_SHADOW_FILE}\" /etc/shadow"
+    echo "sif /etc/shadow mode 0100640"
+    echo "sif /etc/shadow gid ${shadow_gid:-0}"
+    echo "rm /etc/fstab"
+    echo "write \"${_DEBIAN_FSTAB_FILE}\" /etc/fstab"
+    echo "sif /etc/fstab mode 0100644"
+    rootfs_tree_cmds "${_LINUX_LM_DIR_ABS}/usr/lib/modules" /usr/lib/modules
+    if rootfs_has "${RFS_IMG}" /init ; then
+        echo "rm /init"
+    fi
+    echo "symlink /init sbin/init"
+} > "${RFS_CMDS}"
+
+debugfs -w -f "${RFS_CMDS}" "${RFS_IMG}" >/dev/null
+
+# e2fsck returns 1 when it fixed something, which is fine
+e2fsck -fy "${RFS_IMG}" >/dev/null || [[ $? -le 1 ]]
+
+if ! rootfs_has "${RFS_IMG}" /init ; then
+    echo "ERROR: Failed to update the root file system" >&2
+    exit 1
+fi
+
+dd if="${BOOT_IMG}" of="${SDIMG}" bs=512 seek=${BOOT_PART_SECTOR_START} \
+   conv=notrunc status=none
+dd if="${RFS_IMG}" of="${SDIMG}" bs=4M oflag=seek_bytes \
+   seek=$(( ${RFS_PART_SECTOR_START} * 512 )) conv=notrunc,sparse status=none
+
+rm -f "${BOOT_IMG}" "${RFS_IMG}" "${RFS_CMDS}"
 
 cat <<EOS
 
