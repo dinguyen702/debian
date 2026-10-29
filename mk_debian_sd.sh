@@ -71,6 +71,9 @@ declare -r LINUX_LM_DIR="${LINUX_DIR}_modules"
 declare -r ATF_PLAT="agilex5"
 declare -r UBOOT_DEFCONFIG="socfpga_agilex5_defconfig"
 declare -r UBOOT_DTSI="arch/arm/dts/socfpga_agilex5_socdk-u-boot.dtsi"
+declare -r UBOOT_ENV_HEADER="include/configs/socfpga_soc64_common.h"
+# Default env alias: run boot_mmc
+declare -r UBOOT_BOOT_MMC='mmc rescan;setenv bootargs earlycon panic=-1 root=/dev/mmcblk0p2 rw rootwait;fatload mmc 0:1 ${loadaddr} kernel.itb;bootm ${loadaddr}#board-0'
 declare -r LINUX_DTB="intel/socfpga_agilex5_socdk.dtb"
 declare -r LINUX_DTB_NAME="socfpga_agilex5_socdk.dtb"
 declare -r KERNEL_LOAD="0x90000000"
@@ -290,6 +293,32 @@ function rootfs_tree_cmds() {
                return 1 ;;
         esac
     done
+}
+
+# Insert boot_mmc into the Agilex 5 CFG_EXTRA_ENV_SETTINGS blocks.
+function add_uboot_boot_mmc() {
+
+    python3 - "${1}" "${2}" <<'PY'
+import pathlib
+import re
+import sys
+
+hdr = pathlib.Path(sys.argv[1])
+cmd = sys.argv[2]
+text = hdr.read_text()
+text = re.sub(r'\t"boot_mmc=.*?" \\\n', "", text)
+c_cmd = cmd.replace("\\", "\\\\").replace('"', '\\"')
+line = '\t"boot_mmc=' + c_cmd + '\\0" \\\n'
+pat = re.compile(
+    r"(#if IS_ENABLED\(CONFIG_TARGET_SOCFPGA_AGILEX5\)\n"
+    r"\n?#define CFG_EXTRA_ENV_SETTINGS \\\n)"
+)
+new, n = pat.subn(lambda m: m.group(1) + line, text)
+if n < 1:
+    sys.exit(f"error: could not add boot_mmc to {hdr}")
+hdr.write_text(new)
+print(f"Added boot_mmc to {n} U-Boot env block(s)")
+PY
 }
 
 # Write a DOS MBR: the 440-byte bootstrap used by guestfish/parted, a
@@ -532,6 +561,9 @@ sed -i 's/PLATFORM_CPPFLAGS += -D__ARM__/PLATFORM_CPPFLAGS += -D__ARM__ -gdwarf-
 
 # Configure for SD card boot
 sed -i 's/u-boot,spl-boot-order.*/u-boot,spl-boot-order = \&mmc;/g' "${UBOOT_DTSI}"
+if ! add_uboot_boot_mmc "${UBOOT_ENV_HEADER}" "${UBOOT_BOOT_MMC}" ; then
+    exit 1
+fi
 
 # Build U-Boot
 make clean && make mrproper
@@ -888,6 +920,8 @@ Boot from the SD card:
            -o hps=1
   4. Program the JIC and power cycle the board:
        quartus_pgm -c 1 -m jtag -o "pvi;output_file.jic"
+  5. At the U-Boot prompt, boot Debian from MMC with:
+       run boot_mmc
 
 Login:
   user:     ${DEBIAN_USER}
