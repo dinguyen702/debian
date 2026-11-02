@@ -22,7 +22,7 @@
 #   - build-essential
 #   - bison
 #   - flex
-#   - dosfstools, mtools and e2fsprogs for SD image creation
+#   - mtools and e2fsprogs for SD image creation
 #   - u-boot-tools
 #   - python3-setuptools
 #   - python3-dev
@@ -34,10 +34,10 @@
 #   - git
 #   - openssl
 #
-# The SD card image is assembled with mkfs.vfat/mcopy from
+# The SD card image is assembled with mformat/mcopy from
 # agilex5_image.cfg (64M FAT type 0xc bootable, ext4 type 0x83). The
-# DOS partition table is written in-process. No guestfish, sfdisk, or
-# root privileges. Partition 1 starts at 1MiB.
+# DOS partition table is written in-process. No guestfish, sfdisk,
+# mkfs, or root privileges. Partition 1 starts at 1MiB.
 #
 # =============================================================================
 
@@ -133,7 +133,7 @@ declare -r BOOT_PART_SECTORS=$(( ${BOOT_PART_SIZE} / 512 ))
 declare -r RFS_PART_SECTOR_START=$(( ${BOOT_PART_SECTOR_START} + ${BOOT_PART_SECTORS} ))
 declare -r RFS_PART_SECTORS=$(( ${RFS_PART_SIZE} / 512 ))
 # FAT BPB geometry guestfish wrote for a 4G image; SPL's fat_set_blk_dev
-# rejected mkfs.vfat's default 16/32 heads/spt.
+# rejected default 16/32 heads/spt.
 declare -r FAT_BPB_HEADS=133
 declare -r FAT_BPB_SPT=62 
 
@@ -825,9 +825,9 @@ write_dos_mbr "${SDIMG}" \
 # 64M FAT, files from agilex5_image.cfg plus kernel.itb and boot.scr.uimg
 # for the debian FIT boot script.
 rm -f "${BOOT_IMG}"
-truncate -s ${BOOT_PART_SIZE} "${BOOT_IMG}"
-mkfs.vfat -I --mbr=n -F 16 -h ${BOOT_PART_SECTOR_START} \
-    -g ${FAT_BPB_HEADS}/${FAT_BPB_SPT} "${BOOT_IMG}" >/dev/null
+MTOOLS_SKIP_CHECK=1 mformat -C -i "${BOOT_IMG}" \
+    -T ${BOOT_PART_SECTORS} -h ${FAT_BPB_HEADS} -s ${FAT_BPB_SPT} \
+    -H ${BOOT_PART_SECTOR_START} ::
 MTOOLS_SKIP_CHECK=1 mcopy -i "${BOOT_IMG}" \
     "${LINUX_DIR}/arch/arm64/boot/Image" \
     "${LINUX_DIR}/arch/arm64/boot/dts/${LINUX_DTB}" \
