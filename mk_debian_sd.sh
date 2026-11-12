@@ -14,28 +14,12 @@
 # OUTPUT:
 #   sdcard_agilex5.img - Ready to write to SD card
 #
-# REQUIREMENTS:
-# - Linux host system (Ubuntu 22.04+ recommended)
-# - Internet connection for downloading sources
-# - ~20GB free disk space
-# - Packages:
-#   - build-essential
-#   - bison
-#   - flex
-#   - fdisk (sfdisk), dosfstools, mtools and e2fsprogs for SD image creation
-#   - u-boot-tools
-#   - python3-setuptools
-#   - python3-dev
-#   - libssl-dev
-#   - bc 
-#   - xz-utils
-#   - swig
-#   - curl  
-#   - git
-#   - openssl
-#
-# The SD card image is assembled from regular files, so no root privileges
-# are needed to run this script.
+# The SD card image is assembled from regular files, so no root
+# privileges are needed to run this script. Only python3, mtools and
+# e2fsprogs are required. Partition 1 is FAT16 with the BPB guestfish
+# produced (spt 62, heads 133, hidden sectors = partition start) and the
+# MBR carries the parted bootstrap. SPL rejected a FAT with mkfs.vfat's
+# default geometry (fat register err -1).
 #
 # =============================================================================
 
@@ -53,7 +37,7 @@ declare -r _BRANCH="work"
 
 declare -r DEF_CONFIG_FILE="debconf.sh"
 declare -r CONFIG_MANDATORY="ATF_REPO ATF_REF UBOOT_REPO UBOOT_REF LINUX_REPO LINUX_REF"
-declare -r CONFIG_OPTIONAL="UBOOT_ITS_FILE UBOOT_ITS_URL UBOOT_SCRIPT_FILE UBOOT_SCRIPT_URL FABRIC_RBF_FILE FABRIC_RBF_URL"
+declare -r CONFIG_OPTIONAL="UBOOT_ITS_FILE UBOOT_ITS_URL UBOOT_SCRIPT_FILE UBOOT_SCRIPT_URL FABRIC_RBF_FILE FABRIC_RBF_URL BOARD_ID"
 
 # Component URLs and settings
 # Using the musl compiler to make a tight, statically linked Linux environment
@@ -71,15 +55,20 @@ declare -r UBOOT_DEFCONFIG="socfpga_agilex5_defconfig"
 declare -r UBOOT_DTSI="arch/arm/dts/socfpga_agilex5_socdk-u-boot.dtsi"
 declare -r LINUX_DTB="intel/socfpga_agilex5_socdk.dtb"
 declare -r LINUX_DTB_NAME="socfpga_agilex5_socdk.dtb"
+
+# Standard DDR load address for Linux kernel
 declare -r KERNEL_LOAD="0x90000000"
 
 declare -r DEF_UBOOT_ITS_FILE="uboot_script.its"
-declare -r DEF_UBOOT_ITS_URL="https://raw.githubusercontent.com/altera-fpga/meta-altera-fpga/whinlatter/meta-altera-bsp/recipes-bsp/u-boot/bootscr/${DEF_UBOOT_ITS_FILE}"
+declare -r DEF_UBOOT_ITS_URL="https://raw.githubusercontent.com/altera-fpga/meta-altera-fpga/wrynose/meta-altera-bsp/recipes-bsp/u-boot/bootscr/${DEF_UBOOT_ITS_FILE}"
 declare -r DEF_UBOOT_SCRIPT_FILE="uboot.txt"
-declare -r DEF_UBOOT_SCRIPT_URL="https://raw.githubusercontent.com/altera-fpga/meta-altera-fpga/whinlatter/meta-altera-bsp/recipes-bsp/u-boot/bootscr/${DEF_UBOOT_SCRIPT_FILE}"
+declare -r DEF_UBOOT_SCRIPT_URL="https://raw.githubusercontent.com/altera-fpga/meta-altera-fpga/wrynose/meta-altera-bsp/recipes-bsp/u-boot/bootscr/${DEF_UBOOT_SCRIPT_FILE}"
 
 declare -r DEF_FABRIC_RBF_FILE=""
 declare -r DEF_FABRIC_RBF_URL=""
+# FIT configuration name is board-${BOARD_ID}; the boot script uses the
+# same value when U-Boot has no board_id in the environment.
+declare -r DEF_BOARD_ID="0"
 
 declare -r DEBIAN_NAME="trixie"
 declare -r DEBIAN_VERSION="13"
@@ -110,19 +99,24 @@ declare -r SZ_GB=$((${SZ_MB}*${SZ_KB}))
 declare -r SDIMG="sdcard_agilex5.img"
 declare -r SDCARD_IMG_SIZE=$((4*SZ_GB))
 declare -r RFS_PART_SIZE=$((3*${SZ_GB}))
-declare -r BOOT_PART_SIZE=$((200*${SZ_MB}))
+# agilex5_image.cfg: image boot.vfat { size = 64M }
+declare -r BOOT_PART_SIZE=$((64*${SZ_MB}))
+declare -r IMAGE_CFG="agilex5_image.cfg"
 
 # =============================================================================
 # HELPERS AND FUNCTIONS
 # =============================================================================
 
-# Same layout the original guestfish script used. A type-c bootable
-# partition at sector 1 (Buildroot's genimage layout) does not boot
-# with this SPL; partition 1 at 2048 with type 83 does.
+# Layout from agilex5_image.cfg. genimage's empty hdimage aligns to 1MiB
+# (sector 2048). Type 0xc bootable FAT, type 0x83 rootfs.
 declare -r BOOT_PART_SECTOR_START=2048
-declare -r BOOT_PART_SECTOR_END=$(( (${BOOT_PART_SIZE} / 512 ) + ${BOOT_PART_SECTOR_START}))
-declare -r RFS_PART_SECTOR_START=$((${BOOT_PART_SECTOR_END} + 1))
-declare -r RFS_PART_SECTOR_END=$(( (${RFS_PART_SIZE} / 512 ) + ${RFS_PART_SECTOR_START})) 
+declare -r BOOT_PART_SECTORS=$(( ${BOOT_PART_SIZE} / 512 ))
+declare -r RFS_PART_SECTOR_START=$(( ${BOOT_PART_SECTOR_START} + ${BOOT_PART_SECTORS} ))
+declare -r RFS_PART_SECTORS=$(( ${RFS_PART_SIZE} / 512 ))
+# FAT BPB geometry guestfish wrote for a 4G image; SPL's fat_set_blk_dev
+# rejected default 16/32 heads/spt.
+declare -r FAT_BPB_HEADS=133
+declare -r FAT_BPB_SPT=62
 
 # abs paths to files, handy later
 declare _DEBIAN_SHADOW_FILE="$(readlink -f ${DEBIAN_SHADOW_FILE})"
@@ -147,7 +141,7 @@ ${CONFIG_MANDATORY}
 
   - Prefixes:
      - ATF, UBOOT, LINUX refer respectively to Arm Trusted Firmware, U-Boot and the Linux kernel
-  - The suffixes 
+  - The suffixes:
      _REPO: provides the URL of the repo
      _REF: reference to checkout, can be a tag, a branch or a SHA in short or long form
 
@@ -175,11 +169,11 @@ function download() {
     local url="${1}"
     local err=0
 
-    if command -v curl >/dev/null 2>&1; then
-        curl -L --progress-bar -o "${archive}" "${url}"
+    if command -v wget >/dev/null 2>&1; then
+        wget -O "${archive}" "${url}"
 	err=$?
     else
-        echo "ERROR: curl not found. Please install it"
+        echo "ERROR: wget not found. Please install it"
         return 1
     fi  
 
@@ -233,8 +227,8 @@ function clone_and_checkout() {
 
 }
 
-# Write etc/shadow with a usable root password when the file is not already present.
-function write_root_shadow() {
+# Create an etc/shadow with a usable root password when the file is not already present.
+function create_root_shadow() {
 
     local hash
     local days
@@ -282,6 +276,175 @@ function rootfs_tree_cmds() {
     done
 }
 
+# Write a DOS MBR: the 440-byte bootstrap used by guestfish/parted, a
+# disk signature, and up to four partitions. Each partition is
+# start,size,type,bootable (type may be 0xNN).
+function write_dos_mbr() {
+
+    python3 - "$@" <<'PY'
+import os
+import struct
+import sys
+
+# Guestfish/parted bootstrap; images that boot on this SPL have it.
+BOOTSTRAP = bytes.fromhex(
+    "fab800108ed0bc00b0b800008ed88ec0fbbe007cbf0006b90002f3a4ea21060000"
+    "bebe073804750b83c61081fefe0775f3eb16b402b001bb007cb2808a74018b4c02"
+    "cd13ea007c0000ebfe"
+).ljust(440, b"\x00")
+
+# 255 heads, 63 spt. Overflow CHS matches parted (fe c2 ff).
+HEADS = 255
+SPT = 63
+CHS_LIMIT = 1024 * HEADS * SPT
+
+
+def pack_chs(lba):
+    if lba >= CHS_LIMIT:
+        c, h, s = 1023, 254, 2
+    else:
+        c = lba // (HEADS * SPT)
+        rem = lba % (HEADS * SPT)
+        h = rem // SPT
+        s = rem % SPT + 1
+    return bytes((h & 0xFF, (s & 0x3F) | ((c >> 2) & 0xC0), c & 0xFF))
+
+
+def pack_part(start, size, ptype, bootable):
+    last = start + size - 1
+    return struct.pack(
+        "<B3sB3sII",
+        0x80 if bootable else 0x00,
+        pack_chs(start),
+        ptype,
+        pack_chs(last),
+        start,
+        size,
+    )
+
+
+path = sys.argv[1]
+args = sys.argv[2:]
+if len(args) % 4 != 0 or not 1 <= len(args) // 4 <= 4:
+    sys.exit("write_dos_mbr: expected 1-4 partitions as start size type bootable")
+
+table = bytearray()
+for i in range(0, len(args), 4):
+    start = int(args[i], 0)
+    size = int(args[i + 1], 0)
+    ptype = int(args[i + 2], 0)
+    bootable = int(args[i + 3], 0)
+    table += pack_part(start, size, ptype, bootable)
+table += b"\x00" * (64 - len(table))
+
+with open(path, "r+b") as f:
+    f.write(BOOTSTRAP)
+    f.write(os.urandom(4))
+    f.write(b"\x00\x00")
+    f.write(table)
+    f.write(b"\x55\xaa")
+PY
+}
+
+# Debian 13 ext4 enables orphan_file (compat feature bit 12). Host e2fsck
+# 1.46.x does not know that feature and exits 8.
+function e2fsck_rootfs() {
+
+    local img="${1}"
+    local log
+    local st
+
+    log=$(mktemp)
+    set +e
+    e2fsck -fy "${img}" >"${log}" 2>&1
+    st=$?
+    set -e
+    if [[ ${st} -le 1 ]]; then
+        rm -f "${log}"
+        return 0
+    fi
+    if grep -q 'unsupported feature' "${log}"; then
+        echo "warning: host e2fsck is too old for this Debian ext4 image; skipping fsck" >&2
+        rm -f "${log}"
+        return 0
+    fi
+    cat "${log}" >&2
+    rm -f "${log}"
+    return "${st}"
+}
+
+# True when PATH entry is a ccache wrapper (often /usr/lib/ccache/gcc -> ccache).
+# Using that as HOSTCC makes make pass -W... to ccache, which errors.
+function cc_is_ccache() {
+
+    local real
+
+    real=$(readlink -f "${1}")
+    [[ $(basename "${real}") == ccache ]]
+}
+
+function cc_can_link() {
+
+    [[ $("${1}" -print-file-name=crt1.o 2>/dev/null) == /* ]]
+}
+
+# Print the first executable named like gcc/cc that is not a ccache wrapper.
+# $1 is an optional explicit compiler (HOSTCC/HOSTCXX); remaining args are
+# names to search on PATH.
+function lookup_host_compiler() {
+
+    local hint="${1:-}"
+    local name
+    local dir
+    local cand
+    local IFS
+    shift || true
+
+    if [[ -n ${hint} ]]; then
+        if [[ -x ${hint} ]]; then
+            cand="${hint}"
+        else
+            cand=$(command -v "${hint}" 2>/dev/null || true)
+        fi
+        if [[ -n ${cand} && -x ${cand} ]] && ! cc_is_ccache "${cand}" && cc_can_link "${cand}"; then
+            echo "${cand}"
+            return 0
+        fi
+    fi
+
+    IFS=:
+    for name in "$@" ; do
+        for dir in ${PATH} ; do
+            [[ -n ${dir} ]] || continue
+            cand="${dir}/${name}"
+            [[ -x ${cand} ]] || continue
+            if cc_is_ccache "${cand}" || ! cc_can_link "${cand}"; then
+                continue
+            fi
+            echo "${cand}"
+            return 0
+        done
+    done
+    return 1
+}
+
+# Resolve a native host compiler to an absolute path. Do this before the
+# cross toolchain is prepended to PATH so make's host tools are not built
+# with the musl compiler. Prefers HOSTCC/HOSTCXX if already set.
+function find_host_cc() {
+
+    if ! HOSTCC=$(lookup_host_compiler "${HOSTCC:-}" gcc cc); then
+        echo "error: no host C compiler found (set HOSTCC, or install gcc/cc)" >&2
+        return 1
+    fi
+
+    if ! HOSTCXX=$(lookup_host_compiler "${HOSTCXX:-}" g++ c++); then
+        HOSTCXX="${HOSTCC}"
+    fi
+
+    return 0
+}
+
 # =============================================================================
 # CLI 
 # =============================================================================
@@ -296,7 +459,7 @@ while [[ $# -gt 0 ]]; do
         -c)
             shift
             CONFIG_FILE="${1:-}"
-            if [ -z ${CONFIG_FILE} -o ! -f ${CONFIG_FILE} ] ; then
+            if [[ -z "${CONFIG_FILE}" || ! -f "${CONFIG_FILE}" ]]; then
                 echo "error: no config file given or was not found" >&2
                 exit 1
             fi
@@ -333,12 +496,18 @@ UBOOT_SCRIPT_FILE=${UBOOT_SCRIPT_FILE:-${DEF_UBOOT_SCRIPT_FILE}}
 UBOOT_SCRIPT_URL=${UBOOT_SCRIPT_URL:-${DEF_UBOOT_SCRIPT_URL}}
 FABRIC_RBF_FILE=${FABRIC_RBF_FILE:-${DEF_FABRIC_RBF_FILE}}
 FABRIC_RBF_URL=${FABRIC_RBF_URL:-${DEF_FABRIC_RBF_URL}}
+BOARD_ID=${BOARD_ID:-${DEF_BOARD_ID}}
 
 # =============================================================================
 # BUILD PROCESS
 # =============================================================================
 
 echo "[STEP] Setting up build environment..."
+
+if ! find_host_cc ; then
+    exit 1
+fi
+declare -rx HOSTCC HOSTCXX
 
 # Create and enter build directory
 mkdir -p "${OUTPUT_DIR}"
@@ -350,6 +519,7 @@ declare -rx CROSS_COMPILE="${PWD}/${TOOLCHAIN_DIR}/bin/aarch64-unknown-linux-mus
 
 echo "Build directory: ${PWD}"
 echo "Architecture: ${ARCH}"
+echo "Host compiler: ${HOSTCC}"
 echo "Cross compiler: ${CROSS_COMPILE}"
 
 # =============================================================================
@@ -366,7 +536,7 @@ if [[ ! -d "${TOOLCHAIN_DIR}" ]]; then
         if ! download "${TOOLCHAIN_URL}" "${TOOLCHAIN_ARCHIVE}" ; then
 	    echo "error: failed to download the ARM GNU toolchain (${TOOLCHAIN_ARCHIVE})"
 	    exit 1
-	fi
+        fi
     fi
 
     echo "Extracting ARM GNU toolchain..."
@@ -399,8 +569,8 @@ fi
 cd "${ATF_DIR}"
 
 # Clean and build ATF
-make clean
-make -j "${JOBS}" PLAT="${ATF_PLAT}" bl31 ENABLE_LTO=0
+make HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" clean
+make -j "${JOBS}" HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" PLAT="${ATF_PLAT}" bl31 ENABLE_LTO=
 
 cd ..
 
@@ -426,13 +596,13 @@ sed -i 's/PLATFORM_CPPFLAGS += -D__ARM__/PLATFORM_CPPFLAGS += -D__ARM__ -gdwarf-
 sed -i 's/u-boot,spl-boot-order.*/u-boot,spl-boot-order = \&mmc;/g' "${UBOOT_DTSI}"
 
 # Build U-Boot
-make clean && make mrproper
-make "${UBOOT_DEFCONFIG}"
+make HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" clean && make HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" mrproper
+make HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" "${UBOOT_DEFCONFIG}"
 
 # Link directly to ATF bl31.bin in its build directory
 ln -sf "../${ATF_DIR}/build/${ATF_PLAT}/release/bl31.bin" .
 
-make -j "${JOBS}"
+make -j "${JOBS}" HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}"
 
 # spl hex file is needed when JIC file is created. Copy it at a known location
 cp spl/u-boot-spl-dtb.hex ${OUTPUT_DIR_ABS} 
@@ -448,17 +618,27 @@ echo "[STEP] Getting uboot script ..."
 
 # get the updated uboot_script.its everytime
 rm -f "${UBOOT_ITS_FILE}"
+
+echo "downloading from ${UBOOT_ITS_URL}"
 if ! download "${UBOOT_ITS_URL}" "${UBOOT_ITS_FILE}" ; then
-	echo "error: failed to dowbload ${UBOOT_ITS_FILE}"
+	echo "error: failed to download ${UBOOT_ITS_FILE}"
 	exit 3
 fi
 
 # get the updated uboot.txt everytime
 rm -f "${UBOOT_SCRIPT_FILE}"
 if ! download "${UBOOT_SCRIPT_URL}" "${UBOOT_SCRIPT_FILE}" ; then
-	echo "error: failed to dowbload ${UBOOT_SCRIPT_FILE}"
+	echo "error: failed to download ${UBOOT_SCRIPT_FILE}"
 	exit 3
 fi
+
+# The script does bootm ${loadaddr}#board-${board_id}. Set a
+# default when the environment does not already have one.
+{
+       echo "if test -z \"\${board_id}\"; then setenv board_id ${BOARD_ID}; fi"
+       cat "${UBOOT_SCRIPT_FILE}"
+} > "${UBOOT_SCRIPT_FILE}.new"
+mv "${UBOOT_SCRIPT_FILE}.new" "${UBOOT_SCRIPT_FILE}"
 
 mkimage -f "${UBOOT_ITS_FILE}" boot.scr.uimg
 
@@ -486,12 +666,19 @@ CONFIG_MARVELL_PHY=y
 EOF
 
 # Configure and build kernel
-make defconfig
-./scripts/kconfig/merge_config.sh -O ./ ./.config ./config-fragment-agilex5
-make oldconfig
-make -j "${JOBS}" Image && make "${LINUX_DTB}"
-make -j "${JOBS}" modules 
-make -j "${JOBS}" modules_install INSTALL_MOD_PATH="${_LINUX_LM_DIR_ABS}"
+make HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" defconfig
+./scripts/kconfig/merge_config.sh -m -O ./ ./.config ./config-fragment-agilex5
+make HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" olddefconfig
+make -j "${JOBS}" HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" Image && make HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" "${LINUX_DTB}"
+make -j "${JOBS}" HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" modules
+make -j "${JOBS}" HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" modules_install INSTALL_MOD_PATH="${_LINUX_LM_DIR_ABS}"
+
+cd ${_LINUX_LM_DIR_ABS}
+# Debian merges /lib into /usr/lib. A tarball rooted at lib/ replaces that
+# symlink, which removes /lib/systemd. Place modules under usr/lib instead.
+mkdir -p usr
+rm -rf usr/lib
+mv lib usr/lib
 
 cd ..
 
@@ -556,7 +743,7 @@ cat > kernel_test.its <<EOF
         };
 EOF
 
-if [ ! -z ${FABRIC_RBF_FILE} -a ! -z ${FABRIC_RBF_URL} ] ; then
+if [[ -n "${FABRIC_RBF_FILE}" && -n "${FABRIC_RBF_URL}" ]]; then
     if [ ! -e "${FABRIC_RBF_FILE}" ] ; then
         download "${FABRIC_RBF_URL}" "${FABRIC_RBF_FILE}"
     else
@@ -571,7 +758,7 @@ if [ ! -z ${FABRIC_RBF_FILE} -a ! -z ${FABRIC_RBF_URL} ] ; then
 
 	    data = /incbin/("${FABRIC_RBF_FILE}");
 
-            type = "flat_dt";
+            type = "fpga";
 
             arch = "arm64";
 
@@ -588,15 +775,25 @@ cat >> kernel_test.its <<EOF
 
     configurations {
 
-        default = "board-0";
+        default = "board-${BOARD_ID}";
 
-        board-0 {
+        board-${BOARD_ID} {
 
-            description = "board_0";
+            description = "board_${BOARD_ID}";
 
             kernel = "kernel";
 
             fdt = "fdt-0";
+EOF
+
+if [[ -n "${FABRIC_RBF_FILE}" && -n "${FABRIC_RBF_URL}" ]]; then
+    cat >> kernel_test.its <<EOF
+
+            fpga = "fpga-0";
+EOF
+fi
+
+cat >> kernel_test.its <<EOF
 
             hash-1 { algo = "crc32"; };
 
@@ -641,36 +838,44 @@ echo "Debian download complete"
 #
 echo "[STEP] Creating SD card image..."
 
-if ! write_root_shadow ; then
+if ! create_root_shadow ; then
     exit 1
 fi
 
 BOOT_IMG="boot.vfat"
-RFS_IMG="rootfs.ext4"
+RFS_IMG="rootfs.ext2"
 RFS_CMDS="rootfs.debugfs"
-BOOT_PART_SECTORS=$(( ${BOOT_PART_SECTOR_END} - ${BOOT_PART_SECTOR_START} + 1 ))
-RFS_PART_SECTORS=$(( ${RFS_PART_SECTOR_END} - ${RFS_PART_SECTOR_START} + 1 ))
 
-# Partition table
+echo "Assembling ${SDIMG} from ${IMAGE_CFG}"
+
 rm -f "${SDIMG}"
 truncate -s ${SDCARD_IMG_SIZE} "${SDIMG}"
-sfdisk --quiet "${SDIMG}" <<EOF
-label: dos
-unit: sectors
-start=${BOOT_PART_SECTOR_START}, size=${BOOT_PART_SECTORS}, type=83
-start=${RFS_PART_SECTOR_START}, size=${RFS_PART_SECTORS}, type=83
-EOF
+write_dos_mbr "${SDIMG}" \
+    "${BOOT_PART_SECTOR_START}" "${BOOT_PART_SECTORS}" 0x0c 1 \
+    "${RFS_PART_SECTOR_START}" "${RFS_PART_SECTORS}" 0x83 0
 
-# Format a FAT filesystem the size of the partition itself. mkfs.vfat -C
-# takes KiB, so it cannot represent the odd 409601-sector size guestfish
-# used; hidden sectors must match the partition start.
+# 64M FAT, files from agilex5_image.cfg plus kernel.itb and boot.scr.uimg
+# for the debian FIT boot script.
 rm -f "${BOOT_IMG}"
-truncate -s $(( ${BOOT_PART_SECTORS} * 512 )) "${BOOT_IMG}"
-mkfs.vfat -h ${BOOT_PART_SECTOR_START} "${BOOT_IMG}" >/dev/null
-MTOOLS_SKIP_CHECK=1 mcopy -i "${BOOT_IMG}" "${UBOOT_DIR}/u-boot.itb" kernel.itb boot.scr.uimg ::/
+truncate -s ${BOOT_PART_SIZE} "${BOOT_IMG}"
+MTOOLS_SKIP_CHECK=1 mformat -C -i "${BOOT_IMG}" \
+    -T ${BOOT_PART_SECTORS} -h ${FAT_BPB_HEADS} -s ${FAT_BPB_SPT} \
+    -H ${BOOT_PART_SECTOR_START} ::
+MTOOLS_SKIP_CHECK=1 mcopy -i "${BOOT_IMG}" \
+    "${LINUX_DIR}/arch/arm64/boot/Image" \
+    "${LINUX_DIR}/arch/arm64/boot/dts/${LINUX_DTB}" \
+    "${UBOOT_DIR}/u-boot.itb" \
+    kernel.itb boot.scr.uimg ::/
 
-# Root file system, extracted from the first partition of disk.raw
+dd if="${BOOT_IMG}" of="${SDIMG}" bs=512 seek=${BOOT_PART_SECTOR_START} \
+   conv=notrunc status=none
+rm -f "${BOOT_IMG}"
+
 read -r rfs_start rfs_sectors < <(partx -g -n 1 -o START,SECTORS disk.raw)
+if [[ -z ${rfs_start} || -z ${rfs_sectors} ]]; then
+    echo "error: could not read the Debian root partition from disk.raw" >&2
+    exit 1
+fi
 if [[ ${rfs_sectors} -gt ${RFS_PART_SECTORS} ]]; then
     echo "error: the Debian root file system does not fit in the SD card partition" >&2
     exit 1
@@ -680,8 +885,6 @@ dd if=disk.raw of="${RFS_IMG}" bs=4M iflag=skip_bytes,count_bytes \
 
 shadow_gid=$(debugfs -R "stat /etc/shadow" "${RFS_IMG}" 2>/dev/null | sed -n 's/.*Group: *\([0-9]*\).*/\1/p')
 
-# Debian merges /lib into /usr/lib: modules go to /usr/lib/modules so that
-# the /lib symlink is left untouched.
 {
     echo "rm /etc/shadow"
     echo "write \"${_DEBIAN_SHADOW_FILE}\" /etc/shadow"
@@ -690,30 +893,28 @@ shadow_gid=$(debugfs -R "stat /etc/shadow" "${RFS_IMG}" 2>/dev/null | sed -n 's/
     echo "rm /etc/fstab"
     echo "write \"${_DEBIAN_FSTAB_FILE}\" /etc/fstab"
     echo "sif /etc/fstab mode 0100644"
-    rootfs_tree_cmds "${_LINUX_LM_DIR_ABS}/lib/modules" /usr/lib/modules
+    rootfs_tree_cmds "${_LINUX_LM_DIR_ABS}/usr/lib/modules" /usr/lib/modules
     if rootfs_has "${RFS_IMG}" /init ; then
         echo "rm /init"
     fi
     echo "symlink /init sbin/init"
 } > "${RFS_CMDS}"
 
-debugfs -w -f "${RFS_CMDS}" "${RFS_IMG}" >/dev/null
+debugfs -w -f "${RFS_CMDS}" "${RFS_IMG}" >/dev/null 2>&1
 
-# e2fsck returns 1 when it fixed something, which is fine
-e2fsck -fy "${RFS_IMG}" >/dev/null || [[ $? -le 1 ]]
+if ! e2fsck_rootfs "${RFS_IMG}" ; then
+    exit 1
+fi
 
 if ! rootfs_has "${RFS_IMG}" /init ; then
     echo "ERROR: Failed to update the root file system" >&2
     exit 1
 fi
 
-# Assemble the SD card image
-dd if="${BOOT_IMG}" of="${SDIMG}" bs=512 seek=${BOOT_PART_SECTOR_START} \
-   conv=notrunc status=none
 dd if="${RFS_IMG}" of="${SDIMG}" bs=4M oflag=seek_bytes \
    seek=$(( ${RFS_PART_SECTOR_START} * 512 )) conv=notrunc,sparse status=none
 
-rm -f "${BOOT_IMG}" "${RFS_IMG}" "${RFS_CMDS}"
+rm -f "${RFS_IMG}" "${RFS_CMDS}"
 
 cat <<EOS
 
@@ -756,11 +957,5 @@ Boot from the SD card:
 Login:
   user:     ${DEBIAN_USER}
   password: ${DEBIAN_PASS}
-
-After logging in, check that NTP has set the clock:
-  timedatectl show
-If it reports NTPSynchronized=no, NTP is not working (often a firewall
-issue). Set the date manually, for example:
-  date -s '2026-06-22 12:00:00'
 
 EOS
