@@ -256,6 +256,53 @@ function rootfs_has() {
     debugfs -R "stat \"${2}\"" "${1}" 2>/dev/null | grep -q '^Inode:'
 }
 
+# ext4_has_magic <file> [byte offset]: succeeds when an ext4 superblock
+# is at that offset (magic 0xEF53 at +0x438).
+function ext4_has_magic() {
+
+    python3 - "${1}" "${2:-0}" <<'PY'
+import struct
+import sys
+
+path = sys.argv[1]
+off = int(sys.argv[2], 0)
+with open(path, "rb") as f:
+    f.seek(off + 0x438)
+    sys.exit(0 if f.read(2) == b"\x53\xef" else 1)
+PY
+}
+
+# debian_root_partition <disk.raw>: prints "start sectors" of the largest
+# ext4 partition. The nocloud image is GPT: p1 is Linux root, p15 is EFI.
+function debian_root_partition() {
+
+    local disk="${1}"
+    local start
+    local sectors
+    local best_start=""
+    local best_sectors=0
+
+    while read -r start sectors ; do
+        [[ -n ${start} && -n ${sectors} ]] || continue
+        if ext4_has_magic "${disk}" $(( start * 512 )) ; then
+            if [[ ${sectors} -gt ${best_sectors} ]]; then
+                best_start=${start}
+                best_sectors=${sectors}
+            fi
+        fi
+    done < <(partx -g -o START,SECTORS "${disk}")
+
+    if [[ -z ${best_start} ]]; then
+        if ext4_has_magic "${disk}" 0 ; then
+            echo "0 $(( $(stat -c%s "${disk}") / 512 ))"
+            return 0
+        fi
+        return 1
+    fi
+
+    echo "${best_start} ${best_sectors}"
+}
+
 # rootfs_tree_cmds <host dir> <image dir>: prints the debugfs commands that
 # copy the content of <host dir> into the existing <image dir>
 function rootfs_tree_cmds() {
@@ -843,7 +890,7 @@ if ! create_root_shadow ; then
 fi
 
 BOOT_IMG="boot.vfat"
-RFS_IMG="rootfs.ext2"
+RFS_IMG="rootfs.ext4"
 RFS_CMDS="rootfs.debugfs"
 
 echo "Assembling ${SDIMG} from ${IMAGE_CFG}"
@@ -871,17 +918,28 @@ dd if="${BOOT_IMG}" of="${SDIMG}" bs=512 seek=${BOOT_PART_SECTOR_START} \
    conv=notrunc status=none
 rm -f "${BOOT_IMG}"
 
-read -r rfs_start rfs_sectors < <(partx -g -n 1 -o START,SECTORS disk.raw)
+read -r rfs_start rfs_sectors < <(debian_root_partition disk.raw)
 if [[ -z ${rfs_start} || -z ${rfs_sectors} ]]; then
-    echo "error: could not read the Debian root partition from disk.raw" >&2
+    echo "error: could not find an ext4 root filesystem in disk.raw" >&2
     exit 1
 fi
 if [[ ${rfs_sectors} -gt ${RFS_PART_SECTORS} ]]; then
     echo "error: the Debian root file system does not fit in the SD card partition" >&2
     exit 1
 fi
+echo "Debian ext4 at sector ${rfs_start}, ${rfs_sectors} sectors"
+rm -f "${RFS_IMG}"
 dd if=disk.raw of="${RFS_IMG}" bs=4M iflag=skip_bytes,count_bytes \
-   skip=$(( ${rfs_start} * 512 )) count=$(( ${rfs_sectors} * 512 )) conv=sparse status=none
+   skip=$(( ${rfs_start} * 512 )) count=$(( ${rfs_sectors} * 512 )) status=none
+if ! ext4_has_magic "${RFS_IMG}" ; then
+    echo "error: extracted Debian image is not ext4" >&2
+    exit 1
+fi
+# Grow the filesystem to the MMC partition size when host e2fsprogs can.
+truncate -s ${RFS_PART_SIZE} "${RFS_IMG}"
+e2fsck_rootfs "${RFS_IMG}" || true
+resize2fs "${RFS_IMG}" >/dev/null 2>&1 || \
+    echo "warning: could not resize the Debian ext4 image to the MMC partition; systemd-growfs will finish this on first boot" >&2
 
 shadow_gid=$(debugfs -R "stat /etc/shadow" "${RFS_IMG}" 2>/dev/null | sed -n 's/.*Group: *\([0-9]*\).*/\1/p')
 
@@ -912,7 +970,12 @@ if ! rootfs_has "${RFS_IMG}" /init ; then
 fi
 
 dd if="${RFS_IMG}" of="${SDIMG}" bs=4M oflag=seek_bytes \
-   seek=$(( ${RFS_PART_SECTOR_START} * 512 )) conv=notrunc,sparse status=none
+   seek=$(( ${RFS_PART_SECTOR_START} * 512 )) conv=notrunc status=none
+
+if ! ext4_has_magic "${SDIMG}" $(( ${RFS_PART_SECTOR_START} * 512 )) ; then
+    echo "error: MMC partition 2 does not contain an ext4 filesystem" >&2
+    exit 1
+fi
 
 rm -f "${RFS_IMG}" "${RFS_CMDS}"
 
