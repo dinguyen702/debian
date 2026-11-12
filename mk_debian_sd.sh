@@ -25,6 +25,10 @@
 
 set -e  # Exit on any error
 
+# e2fsprogs puts e2fsck, resize2fs and debugfs in /usr/sbin, which is
+# often missing from a non-root PATH.
+PATH="/usr/sbin:/sbin:${PATH}"
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -400,6 +404,11 @@ function e2fsck_rootfs() {
     local img="${1}"
     local log
     local st
+
+    if ! command -v e2fsck >/dev/null 2>&1 ; then
+        echo "warning: e2fsck not found; skipping fsck" >&2
+        return 0
+    fi
 
     log=$(mktemp)
     set +e
@@ -885,6 +894,11 @@ echo "Debian download complete"
 #
 echo "[STEP] Creating SD card image..."
 
+if ! command -v debugfs >/dev/null 2>&1 ; then
+    echo "error: debugfs not found (install e2fsprogs)" >&2
+    exit 1
+fi
+
 if ! create_root_shadow ; then
     exit 1
 fi
@@ -938,8 +952,11 @@ fi
 # Grow the filesystem to the MMC partition size when host e2fsprogs can.
 truncate -s ${RFS_PART_SIZE} "${RFS_IMG}"
 e2fsck_rootfs "${RFS_IMG}" || true
-resize2fs "${RFS_IMG}" >/dev/null 2>&1 || \
+if command -v resize2fs >/dev/null 2>&1 && resize2fs "${RFS_IMG}" >/dev/null 2>&1 ; then
+    :
+else
     echo "warning: could not resize the Debian ext4 image to the MMC partition; systemd-growfs will finish this on first boot" >&2
+fi
 
 shadow_gid=$(debugfs -R "stat /etc/shadow" "${RFS_IMG}" 2>/dev/null | sed -n 's/.*Group: *\([0-9]*\).*/\1/p')
 
