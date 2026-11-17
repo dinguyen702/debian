@@ -1,48 +1,33 @@
 #!/bin/bash
 # =============================================================================
-# SoCFPGA HPS Debian Linux SD Card Example Script
+# Agilex 5 HPS Debian Linux Example Script
 # =============================================================================
 #
 # PURPOSE:
-# This script builds an SD card boot image for Altera SoCFPGA HPS systems to
+# This script builds an SD card boot image for Altera Agilex 5 HPS systems to
 # start Debian.
 # The SD card image produced from this script will demonstrate the HPS first boot flow
 #
 # USAGE:
-#   ./mk_debian_sd_s10.sh [-p agilex5|agilex3|stratix10|arria10] [-c debconf.sh]
+#   ./mk_debian_sd.sh [-c debconf.sh]
 #
 # OUTPUT:
-#   sdcard_<platform>.img - Ready to write to SD card
+#   sdcard_agilex5.img - Ready to write to SD card
 #
-# REQUIREMENTS:
-# - Linux host system (Ubuntu 22.04+ recommended)
-# - Internet connection for downloading sources
-# - ~20GB free disk space
-# - Packages:
-#   - build-essential
-#   - bison
-#   - flex
-#   - guestfs-tools for SD image creation
-#   - u-boot-tools
-#   - python3-setuptools
-#   - python3-dev
-#   - libssl-dev
-#   - bc 
-#   - xz-utils
-#   - swig
-#   - sudo
-#   - curl  
-#   - git
-#   - openssl
-#
-# This script uses guestfs tools to create an SD card image.
-# For the tools to work efficiently, it is
-# important the kernel image file in the host's /boot be readable by all users
-# and that the user running the script be part of the group 'kvm'.
+# The SD card image is assembled from regular files, so no root
+# privileges are needed to run this script. Only python3, mtools and
+# e2fsprogs are required. Partition 1 is FAT16 with the BPB guestfish
+# produced (spt 62, heads 133, hidden sectors = partition start) and the
+# MBR carries the parted bootstrap. SPL rejected a FAT with mkfs.vfat's
+# default geometry (fat register err -1).
 #
 # =============================================================================
 
 set -e  # Exit on any error
+
+# e2fsprogs puts e2fsck, resize2fs and debugfs in /usr/sbin, which is
+# often missing from a non-root PATH.
+PATH="/usr/sbin:/sbin:${PATH}"
 
 # =============================================================================
 # CONFIGURATION
@@ -56,35 +41,44 @@ declare -r _BRANCH="work"
 
 declare -r DEF_CONFIG_FILE="debconf.sh"
 declare -r CONFIG_MANDATORY="ATF_REPO ATF_REF UBOOT_REPO UBOOT_REF LINUX_REPO LINUX_REF"
-declare -r CONFIG_OPTIONAL="UBOOT_ITS_FILE UBOOT_ITS_URL UBOOT_SCRIPT_FILE UBOOT_SCRIPT_URL FABRIC_RBF_FILE FABRIC_RBF_URL"
+declare -r CONFIG_OPTIONAL="UBOOT_ITS_FILE UBOOT_ITS_URL UBOOT_SCRIPT_FILE UBOOT_SCRIPT_URL FABRIC_RBF_FILE FABRIC_RBF_URL BOARD_ID"
 
 # Component URLs and settings
-# Toolchain URL and directory are selected with the platform (see select_platform).
 # Using the musl compiler to make a tight, statically linked Linux environment
-declare -r TOOLCHAIN_RELEASE="https://github.com/cross-tools/musl-cross/releases/download/20250929"
+declare -r TOOLCHAIN_URL="https://github.com/cross-tools/musl-cross/releases/download/20250929/aarch64-unknown-linux-musl.tar.xz"
+declare -r TOOLCHAIN_DIR="aarch64-unknown-linux-musl"
 
 declare -r ATF_DIR="arm-trusted-firmware"
 declare -r UBOOT_DIR="u-boot-socfpga"
 declare -r LINUX_DIR="linux-socfpga"
 declare -r LINUX_LM_DIR="${LINUX_DIR}_modules"
 
+# Agilex 5 SoC Development Kit
+declare -r ATF_PLAT="agilex5"
+declare -r UBOOT_DEFCONFIG="socfpga_agilex5_defconfig"
+declare -r UBOOT_DTSI="arch/arm/dts/socfpga_agilex5_socdk-u-boot.dtsi"
+declare -r LINUX_DTB="intel/socfpga_agilex5_socdk.dtb"
+declare -r LINUX_DTB_NAME="socfpga_agilex5_socdk.dtb"
+
+# Standard DDR load address for Linux kernel
+declare -r KERNEL_LOAD="0x90000000"
+
 declare -r DEF_UBOOT_ITS_FILE="uboot_script.its"
-declare -r DEF_UBOOT_ITS_URL="https://raw.githubusercontent.com/altera-fpga/meta-altera-fpga/whinlatter/meta-altera-bsp/recipes-bsp/u-boot/bootscr/${DEF_UBOOT_ITS_FILE}"
+declare -r DEF_UBOOT_ITS_URL="https://raw.githubusercontent.com/altera-fpga/meta-altera-fpga/wrynose/meta-altera-bsp/recipes-bsp/u-boot/bootscr/${DEF_UBOOT_ITS_FILE}"
 declare -r DEF_UBOOT_SCRIPT_FILE="uboot.txt"
-declare -r DEF_UBOOT_SCRIPT_URL="https://raw.githubusercontent.com/altera-fpga/meta-altera-fpga/whinlatter/meta-altera-bsp/recipes-bsp/u-boot/bootscr/${DEF_UBOOT_SCRIPT_FILE}"
+declare -r DEF_UBOOT_SCRIPT_URL="https://raw.githubusercontent.com/altera-fpga/meta-altera-fpga/wrynose/meta-altera-bsp/recipes-bsp/u-boot/bootscr/${DEF_UBOOT_SCRIPT_FILE}"
 
 declare -r DEF_FABRIC_RBF_FILE=""
 declare -r DEF_FABRIC_RBF_URL=""
+# FIT configuration name is board-${BOARD_ID}; the boot script uses the
+# same value when U-Boot has no board_id in the environment.
+declare -r DEF_BOARD_ID="0"
 
 declare -r DEBIAN_NAME="trixie"
 declare -r DEBIAN_VERSION="13"
-# arm64 cloud image. The tarball contains disk.raw.
-declare -r DEBIAN_ARM64_ARCHIVE="debian-13-nocloud-arm64-20260623-2518.tar.xz"
-declare -r DEBIAN_ARM64_URL="https://cloud.debian.org/images/cloud/trixie/20260623-2518/${DEBIAN_ARM64_ARCHIVE}"
-# Debian does not publish nocloud images for armhf. This is a Debian 13
-# armhf root filesystem (debootstrap) for Arria 10.
-declare -r DEBIAN_ARMHF_ARCHIVE="debian-13-armhf-rootfs-20260921.tar.xz"
-declare -r DEBIAN_ARMHF_URL="https://images.linuxcontainers.org/images/debian/trixie/armhf/default/20260921_05%3A24/rootfs.tar.xz"
+# The tarball contains disk.raw.
+declare -r DEBIAN_ARCHIVE="debian-13-nocloud-arm64-20260623-2518.tar.xz"
+declare -r DEBIAN_URL="https://cloud.debian.org/images/cloud/trixie/20260623-2518/${DEBIAN_ARCHIVE}"
 
 # Created from DEBIAN_PASS when missing, then copied over the image's /etc/shadow
 # so the root account can log in.
@@ -106,19 +100,27 @@ declare -r SZ_MB=$((${SZ_KB}*${SZ_KB}))
 declare -r SZ_GB=$((${SZ_MB}*${SZ_KB}))
 
 # sizes in bytes
-# SDIMG is set after the platform is chosen: sdcard_<platform>.img
+declare -r SDIMG="sdcard_agilex5.img"
 declare -r SDCARD_IMG_SIZE=$((4*SZ_GB))
 declare -r RFS_PART_SIZE=$((3*${SZ_GB}))
-declare -r BOOT_PART_SIZE=$((200*${SZ_MB}))
+# agilex5_image.cfg: image boot.vfat { size = 64M }
+declare -r BOOT_PART_SIZE=$((64*${SZ_MB}))
+declare -r IMAGE_CFG="agilex5_image.cfg"
 
 # =============================================================================
 # HELPERS AND FUNCTIONS
 # =============================================================================
 
+# Layout from agilex5_image.cfg. genimage's empty hdimage aligns to 1MiB
+# (sector 2048). Type 0xc bootable FAT, type 0x83 rootfs.
 declare -r BOOT_PART_SECTOR_START=2048
-declare -r BOOT_PART_SECTOR_END=$(( (${BOOT_PART_SIZE} / 512 ) + ${BOOT_PART_SECTOR_START})) 
-declare -r RFS_PART_SECTOR_START=$((${BOOT_PART_SECTOR_END} + 1))
-declare -r RFS_PART_SECTOR_END=$(( (${RFS_PART_SIZE} / 512 ) + ${RFS_PART_SECTOR_START})) 
+declare -r BOOT_PART_SECTORS=$(( ${BOOT_PART_SIZE} / 512 ))
+declare -r RFS_PART_SECTOR_START=$(( ${BOOT_PART_SECTOR_START} + ${BOOT_PART_SECTORS} ))
+declare -r RFS_PART_SECTORS=$(( ${RFS_PART_SIZE} / 512 ))
+# FAT BPB geometry guestfish wrote for a 4G image; SPL's fat_set_blk_dev
+# rejected default 16/32 heads/spt.
+declare -r FAT_BPB_HEADS=133
+declare -r FAT_BPB_SPT=62
 
 # abs paths to files, handy later
 declare _DEBIAN_SHADOW_FILE="$(readlink -f ${DEBIAN_SHADOW_FILE})"
@@ -127,28 +129,14 @@ declare _DEBIAN_FSTAB_FILE="$(readlink -f ${DEBIAN_FSTAB_FILE})"
 # usage
 declare -r SELF="$(basename $0)"
 
-# Supported -p values. agilex3 reuses the Agilex 5 TF-A platform: socfpga_v2.14.1
-# has no separate agilex3 port. Arria 10 is a Cortex-A9 and does not use TF-A.
-declare -r SUPPORTED_PLATFORMS="agilex5 agilex3 stratix10 arria10"
-declare -r DEF_PLATFORM="agilex5"
-
 function usage() {
 
     cat <<EOH
-Builds an SD card image with an unmodified Debian run time.
+Builds an Agilex 5 SD card image with an unmodified Debian run time.
 
-Usage: ${SELF} [-h] [-p <platform>] [-c <file>]
+Usage: ${SELF} [-h] [-c <file>]
     -h: prints this message
-    -p: SoCFPGA platform. One of: ${SUPPORTED_PLATFORMS}
-        When -p is omitted, a menu is shown. Pressing Enter keeps the
-        default (PLATFORM= from the configuration file, or ${DEF_PLATFORM}).
     -c: specifies a configuration file to use.
-
-Platforms
-    agilex5    Agilex 5 SoC Development Kit (arm64, TF-A PLAT=agilex5)
-    agilex3    Agilex 3 SoC Development Kit (arm64, TF-A PLAT=agilex5)
-    stratix10  Stratix 10 SoC Development Kit (arm64, TF-A PLAT=stratix10)
-    arria10    Arria 10 SoC Development Kit (arm, no TF-A, armhf Debian rootfs)
 
 Configuration file
 
@@ -157,7 +145,7 @@ ${CONFIG_MANDATORY}
 
   - Prefixes:
      - ATF, UBOOT, LINUX refer respectively to Arm Trusted Firmware, U-Boot and the Linux kernel
-  - The suffixes 
+  - The suffixes:
      _REPO: provides the URL of the repo
      _REF: reference to checkout, can be a tag, a branch or a SHA in short or long form
 
@@ -185,14 +173,14 @@ function download() {
     local url="${1}"
     local err=0
 
-    if command -v curl >/dev/null 2>&1; then
-        curl -L --progress-bar -o "${archive}" "${url}"
-	err=$?
+    if /usr/bin/curl --version >/dev/null 2>&1; then
+        /usr/bin/curl -fL --progress-bar -o "${archive}" "${url}" || return $?
+    elif /usr/bin/wget --version >/dev/null 2>&1; then
+        /usr/bin/wget -O "${archive}" "${url}" || return $?
     else
-        echo "ERROR: curl not found. Please install it"
+        echo "ERROR: Neither wget nor curl found. Please install one of them." >&2
         return 1
-    fi  
-
+    fi
     return ${err}
 }
 
@@ -243,99 +231,8 @@ function clone_and_checkout() {
 
 }
 
-# Map a platform name onto the ATF, U-Boot, kernel, and toolchain settings
-# used by the rest of this script.
-function select_platform() {
-
-    local plat="${1}"
-
-    case "${plat}" in
-        agilex5)
-            PLATFORM_TITLE="Agilex 5"
-            TARGET_ARCH="arm64"
-            ATF_PLAT="agilex5"
-            UBOOT_DEFCONFIG="socfpga_agilex5_defconfig"
-            UBOOT_DTSI="arch/arm/dts/socfpga_agilex5_socdk-u-boot.dtsi"
-            UBOOT_BIN="u-boot.itb"
-            SPL_ARTIFACT="spl/u-boot-spl-dtb.hex"
-            LINUX_DTB="intel/socfpga_agilex5_socdk.dtb"
-            KERNEL_FIT_ARCH="arm64"
-            KERNEL_FIT_COMPRESSION="lzma"
-            KERNEL_LOAD="0x90000000"
-            QUARTUS_DEVICE="MT25QU128"
-            QUARTUS_FLASH_LOADER="A5ED065BB32AE6SR0"
-            QUARTUS_MODE="ASX4"
-            ;;
-        agilex3)
-            PLATFORM_TITLE="Agilex 3"
-            TARGET_ARCH="arm64"
-            ATF_PLAT="agilex5"
-            UBOOT_DEFCONFIG="socfpga_agilex3_defconfig"
-            UBOOT_DTSI="arch/arm/dts/socfpga_agilex3_socdk-u-boot.dtsi"
-            UBOOT_BIN="u-boot.itb"
-            SPL_ARTIFACT="spl/u-boot-spl-dtb.hex"
-            LINUX_DTB="intel/socfpga_agilex3_socdk.dtb"
-            KERNEL_FIT_ARCH="arm64"
-            KERNEL_FIT_COMPRESSION="lzma"
-            KERNEL_LOAD="0x90000000"
-            QUARTUS_DEVICE=""
-            QUARTUS_FLASH_LOADER=""
-            QUARTUS_MODE=""
-            ;;
-        stratix10)
-            PLATFORM_TITLE="Stratix 10"
-            TARGET_ARCH="arm64"
-            ATF_PLAT="stratix10"
-            UBOOT_DEFCONFIG="socfpga_stratix10_defconfig"
-            UBOOT_DTSI="arch/arm/dts/socfpga_stratix10_socdk-u-boot.dtsi"
-            UBOOT_BIN="u-boot.itb"
-            SPL_ARTIFACT="spl/u-boot-spl-dtb.hex"
-            LINUX_DTB="altera/socfpga_stratix10_socdk.dtb"
-            KERNEL_FIT_ARCH="arm64"
-            KERNEL_FIT_COMPRESSION="lzma"
-            KERNEL_LOAD="0x86000000"
-            QUARTUS_DEVICE=""
-            QUARTUS_FLASH_LOADER=""
-            QUARTUS_MODE=""
-            ;;
-        arria10)
-            PLATFORM_TITLE="Arria 10"
-            TARGET_ARCH="arm"
-            ATF_PLAT=""
-            UBOOT_DEFCONFIG="socfpga_arria10_defconfig"
-            UBOOT_DTSI="arch/arm/dts/socfpga_arria10_socdk_sdmmc-u-boot.dtsi"
-            UBOOT_BIN="u-boot.img"
-            SPL_ARTIFACT="spl/u-boot-splx4.sfp"
-            LINUX_DTB="intel/socfpga/socfpga_arria10_socdk_sdmmc.dtb"
-            KERNEL_FIT_ARCH="arm"
-            KERNEL_FIT_COMPRESSION="none"
-            KERNEL_LOAD="0x8000"
-            QUARTUS_DEVICE=""
-            QUARTUS_FLASH_LOADER=""
-            QUARTUS_MODE=""
-            ;;
-        *)
-            echo "error: unknown platform '${plat}'" >&2
-            echo "supported platforms: ${SUPPORTED_PLATFORMS}" >&2
-            return 1
-            ;;
-    esac
-
-    if [[ ${TARGET_ARCH} == arm64 ]]; then
-        TOOLCHAIN_DIR="aarch64-unknown-linux-musl"
-    else
-        TOOLCHAIN_DIR="armv7-unknown-linux-musleabihf"
-    fi
-    TOOLCHAIN_URL="${TOOLCHAIN_RELEASE}/${TOOLCHAIN_DIR}.tar.xz"
-    TOOLCHAIN_PREFIX="${TOOLCHAIN_DIR}-"
-    LINUX_DTB_NAME="$(basename "${LINUX_DTB}")"
-    SPL_ARTIFACT_NAME="$(basename "${SPL_ARTIFACT}")"
-
-    return 0
-}
-
-# Write etc/shadow with a usable root password when the file is not already present.
-function write_root_shadow() {
+# Create an etc/shadow with a usable root password when the file is not already present.
+function create_root_shadow() {
 
     local hash
     local days
@@ -357,54 +254,261 @@ function write_root_shadow() {
     return 0
 }
 
-# Prompt for a platform. Sets PLATFORM. A bare Enter keeps the default.
-function choose_platform() {
+# rootfs_has <ext4 image> <path>: succeeds when <path> exists in the image
+function rootfs_has() {
 
-    local default="${1}"
-    local -a platforms
-    local -a titles
-    local choice
-    local i
-    local plat
+    debugfs -R "stat \"${2}\"" "${1}" 2>/dev/null | grep -q '^Inode:'
+}
 
-    read -r -a platforms <<< "${SUPPORTED_PLATFORMS}"
-    titles=(
-        "Agilex 5 SoC Development Kit"
-        "Agilex 3 SoC Development Kit"
-        "Stratix 10 SoC Development Kit"
-        "Arria 10 SoC Development Kit"
+# ext4_has_magic <file> [byte offset]: succeeds when an ext4 superblock
+# is at that offset (magic 0xEF53 at +0x438).
+function ext4_has_magic() {
+
+    python3 - "${1}" "${2:-0}" <<'PY'
+import struct
+import sys
+
+path = sys.argv[1]
+off = int(sys.argv[2], 0)
+with open(path, "rb") as f:
+    f.seek(off + 0x438)
+    sys.exit(0 if f.read(2) == b"\x53\xef" else 1)
+PY
+}
+
+# debian_root_partition <disk.raw>: prints "start sectors" of the largest
+# ext4 partition. The nocloud image is GPT: p1 is Linux root, p15 is EFI.
+function debian_root_partition() {
+
+    local disk="${1}"
+    local start
+    local sectors
+    local best_start=""
+    local best_sectors=0
+
+    while read -r start sectors ; do
+        [[ -n ${start} && -n ${sectors} ]] || continue
+        if ext4_has_magic "${disk}" $(( start * 512 )) ; then
+            if [[ ${sectors} -gt ${best_sectors} ]]; then
+                best_start=${start}
+                best_sectors=${sectors}
+            fi
+        fi
+    done < <(partx -g -o START,SECTORS "${disk}")
+
+    if [[ -z ${best_start} ]]; then
+        if ext4_has_magic "${disk}" 0 ; then
+            echo "0 $(( $(stat -c%s "${disk}") / 512 ))"
+            return 0
+        fi
+        return 1
+    fi
+
+    echo "${best_start} ${best_sectors}"
+}
+
+
+# rootfs_tree_cmds <host dir> <image dir>: prints the debugfs commands that
+# copy the content of <host dir> into the existing <image dir>
+function rootfs_tree_cmds() {
+
+    local src="${1}"
+    local dst="${2}"
+    local type
+    local path
+
+    (cd "${src}" && find . -mindepth 1 -printf '%y %P\n') | while read -r type path ; do
+        case "${type}" in
+            d) echo "mkdir \"${dst}/${path}\"" ;;
+            f) echo "write \"${src}/${path}\" \"${dst}/${path}\"" ;;
+            l) echo "symlink \"${dst}/${path}\" \"$(readlink "${src}/${path}")\"" ;;
+            *) echo "${FUNCNAME}: error: unsupported file type: ${src}/${path}" >&2
+               return 1 ;;
+        esac
+    done
+}
+
+# Write a DOS MBR: the 440-byte bootstrap used by guestfish/parted, a
+# disk signature, and up to four partitions. Each partition is
+# start,size,type,bootable (type may be 0xNN).
+function write_dos_mbr() {
+
+    python3 - "$@" <<'PY'
+import os
+import struct
+import sys
+
+# Guestfish/parted bootstrap; images that boot on this SPL have it.
+BOOTSTRAP = bytes.fromhex(
+    "fab800108ed0bc00b0b800008ed88ec0fbbe007cbf0006b90002f3a4ea21060000"
+    "bebe073804750b83c61081fefe0775f3eb16b402b001bb007cb2808a74018b4c02"
+    "cd13ea007c0000ebfe"
+).ljust(440, b"\x00")
+
+# 255 heads, 63 spt. Overflow CHS matches parted (fe c2 ff).
+HEADS = 255
+SPT = 63
+CHS_LIMIT = 1024 * HEADS * SPT
+
+
+def pack_chs(lba):
+    if lba >= CHS_LIMIT:
+        c, h, s = 1023, 254, 2
+    else:
+        c = lba // (HEADS * SPT)
+        rem = lba % (HEADS * SPT)
+        h = rem // SPT
+        s = rem % SPT + 1
+    return bytes((h & 0xFF, (s & 0x3F) | ((c >> 2) & 0xC0), c & 0xFF))
+
+
+def pack_part(start, size, ptype, bootable):
+    last = start + size - 1
+    return struct.pack(
+        "<B3sB3sII",
+        0x80 if bootable else 0x00,
+        pack_chs(start),
+        ptype,
+        pack_chs(last),
+        start,
+        size,
     )
 
-    echo "Select a platform:"
-    for i in "${!platforms[@]}"; do
-        printf "  %d) %-12s %s\n" "$((i + 1))" "${platforms[i]}" "${titles[i]}"
-    done
 
-    while true; do
-        read -r -p "Choice [${default}]: " choice
-        if [[ -z ${choice} ]]; then
-            PLATFORM="${default}"
+path = sys.argv[1]
+args = sys.argv[2:]
+if len(args) % 4 != 0 or not 1 <= len(args) // 4 <= 4:
+    sys.exit("write_dos_mbr: expected 1-4 partitions as start size type bootable")
+
+table = bytearray()
+for i in range(0, len(args), 4):
+    start = int(args[i], 0)
+    size = int(args[i + 1], 0)
+    ptype = int(args[i + 2], 0)
+    bootable = int(args[i + 3], 0)
+    table += pack_part(start, size, ptype, bootable)
+table += b"\x00" * (64 - len(table))
+
+with open(path, "r+b") as f:
+    f.write(BOOTSTRAP)
+    f.write(os.urandom(4))
+    f.write(b"\x00\x00")
+    f.write(table)
+    f.write(b"\x55\xaa")
+PY
+}
+
+# Debian 13 ext4 enables orphan_file (compat feature bit 12). Host e2fsck
+# 1.46.x does not know that feature and exits 8.
+function e2fsck_rootfs() {
+
+    local img="${1}"
+    local log
+    local st
+
+    if ! command -v e2fsck >/dev/null 2>&1 ; then
+        echo "warning: e2fsck not found; skipping fsck" >&2
+        return 0
+    fi
+
+    log=$(mktemp)
+    set +e
+    e2fsck -fy "${img}" >"${log}" 2>&1
+    st=$?
+    set -e
+    if [[ ${st} -le 1 ]]; then
+        rm -f "${log}"
+        return 0
+    fi
+    if grep -q 'unsupported feature' "${log}"; then
+        echo "warning: host e2fsck is too old for this Debian ext4 image; skipping fsck" >&2
+        rm -f "${log}"
+        return 0
+    fi
+    cat "${log}" >&2
+    rm -f "${log}"
+    return "${st}"
+}
+
+# True when PATH entry is a ccache wrapper (often /usr/lib/ccache/gcc -> ccache).
+# Using that as HOSTCC makes make pass -W... to ccache, which errors.
+function cc_is_ccache() {
+
+    local real
+
+    real=$(readlink -f "${1}")
+    [[ $(basename "${real}") == ccache ]]
+}
+
+function cc_can_link() {
+
+    [[ $("${1}" -print-file-name=crt1.o 2>/dev/null) == /* ]]
+}
+
+# Print the first executable named like gcc/cc that is not a ccache wrapper.
+# $1 is an optional explicit compiler (HOSTCC/HOSTCXX); remaining args are
+# names to search on PATH.
+function lookup_host_compiler() {
+
+    local hint="${1:-}"
+    local name
+    local dir
+    local cand
+    local IFS
+    shift || true
+
+    if [[ -n ${hint} ]]; then
+        if [[ -x ${hint} ]]; then
+            cand="${hint}"
+        else
+            cand=$(command -v "${hint}" 2>/dev/null || true)
+        fi
+        if [[ -n ${cand} && -x ${cand} ]] && ! cc_is_ccache "${cand}" && cc_can_link "${cand}"; then
+            echo "${cand}"
             return 0
         fi
-        if [[ ${choice} =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#platforms[@]} )); then
-            PLATFORM="${platforms[choice - 1]}"
-            return 0
-        fi
-        for plat in "${platforms[@]}"; do
-            if [[ ${choice} == "${plat}" ]]; then
-                PLATFORM="${plat}"
-                return 0
+    fi
+
+    IFS=:
+    for name in "$@" ; do
+        for dir in ${PATH} ; do
+            [[ -n ${dir} ]] || continue
+            cand="${dir}/${name}"
+            [[ -x ${cand} ]] || continue
+            if cc_is_ccache "${cand}" || ! cc_can_link "${cand}"; then
+                continue
             fi
+            echo "${cand}"
+            return 0
         done
-        echo "Enter a number from 1 to ${#platforms[@]}, or one of: ${SUPPORTED_PLATFORMS}" >&2
     done
+    return 1
+}
+
+# Resolve a native host compiler to an absolute path. Do this before the
+# cross toolchain is prepended to PATH so make's host tools are not built
+# with the musl compiler. Prefers HOSTCC/HOSTCXX if already set.
+function find_host_cc() {
+
+    if ! HOSTCC=$(lookup_host_compiler "${HOSTCC:-}" gcc cc); then
+        echo "error: no host C compiler found (set HOSTCC, or install gcc/cc)" >&2
+        return 1
+    fi
+
+    if ! HOSTCXX=$(lookup_host_compiler "${HOSTCXX:-}" g++ c++); then
+        HOSTCXX="${HOSTCC}"
+    fi
+
+    [[ ${HOSTCC} == /* ]] || HOSTCC="${PWD}/${HOSTCC}"
+    [[ ${HOSTCXX} == /* ]] || HOSTCXX="${PWD}/${HOSTCXX}"
+
+    return 0
 }
 
 # =============================================================================
 # CLI 
 # =============================================================================
 declare CONFIG_FILE="${DEF_CONFIG_FILE}"
-declare PLATFORM_ARG=""
 
 while [[ $# -gt 0 ]]; do
     case "${1}" in
@@ -415,16 +519,8 @@ while [[ $# -gt 0 ]]; do
         -c)
             shift
             CONFIG_FILE="${1:-}"
-            if [ -z ${CONFIG_FILE} -o ! -f ${CONFIG_FILE} ] ; then
+            if [[ -z "${CONFIG_FILE}" || ! -f "${CONFIG_FILE}" ]]; then
                 echo "error: no config file given or was not found" >&2
-                exit 1
-            fi
-            ;;
-        -p)
-            shift
-            PLATFORM_ARG="${1:-}"
-            if [ -z "${PLATFORM_ARG}" ] ; then
-                echo "error: -p requires a platform (${SUPPORTED_PLATFORMS})" >&2
                 exit 1
             fi
             ;;
@@ -437,6 +533,10 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
+echo "======================================================================"
+echo "   Agilex 5 HPS SD Card Boot Flow Builder"
+echo "======================================================================"
+
 # =============================================================================
 # CHECK CONFIG
 # =============================================================================
@@ -448,45 +548,6 @@ if ! check_config ; then
     exit 127
 fi
 
-# -p skips the menu. Otherwise ask, unless this is not a terminal.
-if [[ -n ${PLATFORM_ARG} ]]; then
-    PLATFORM="${PLATFORM_ARG}"
-elif [[ -t 0 ]]; then
-    choose_platform "${PLATFORM:-${DEF_PLATFORM}}"
-else
-    PLATFORM="${PLATFORM:-${DEF_PLATFORM}}"
-    echo "No terminal; using platform ${PLATFORM}"
-fi
-
-if ! select_platform "${PLATFORM}" ; then
-    exit 1
-fi
-
-SDIMG="sdcard_${PLATFORM}.img"
-
-echo "======================================================================"
-echo "   ${PLATFORM_TITLE} HPS SD Card Boot Flow Builder"
-echo "======================================================================"
-echo "Platform: ${PLATFORM}"
-if [[ -n ${ATF_PLAT} ]]; then
-    echo "ATF PLAT: ${ATF_PLAT}"
-else
-    echo "ATF PLAT: (none)"
-fi
-echo "U-Boot defconfig: ${UBOOT_DEFCONFIG}"
-echo "Linux DTB: ${LINUX_DTB}"
-
-if [[ ${TARGET_ARCH} == arm64 ]]; then
-    DEBIAN_ARCHIVE="${DEBIAN_ARM64_ARCHIVE}"
-    DEBIAN_URL="${DEBIAN_ARM64_URL}"
-    DEBIAN_ROOTFS_KIND="disk"
-else
-    DEBIAN_ARCHIVE="${DEBIAN_ARMHF_ARCHIVE}"
-    DEBIAN_URL="${DEBIAN_ARMHF_URL}"
-    DEBIAN_ROOTFS_KIND="tar"
-fi
-echo "Debian rootfs: ${DEBIAN_ARCHIVE}"
-
 # for the optional variables, we pickup the default value if 
 # not set in config file
 UBOOT_ITS_FILE=${UBOOT_ITS_FILE:-${DEF_UBOOT_ITS_FILE}}
@@ -495,6 +556,7 @@ UBOOT_SCRIPT_FILE=${UBOOT_SCRIPT_FILE:-${DEF_UBOOT_SCRIPT_FILE}}
 UBOOT_SCRIPT_URL=${UBOOT_SCRIPT_URL:-${DEF_UBOOT_SCRIPT_URL}}
 FABRIC_RBF_FILE=${FABRIC_RBF_FILE:-${DEF_FABRIC_RBF_FILE}}
 FABRIC_RBF_URL=${FABRIC_RBF_URL:-${DEF_FABRIC_RBF_URL}}
+BOARD_ID=${BOARD_ID:-${DEF_BOARD_ID}}
 
 # =============================================================================
 # BUILD PROCESS
@@ -502,16 +564,22 @@ FABRIC_RBF_URL=${FABRIC_RBF_URL:-${DEF_FABRIC_RBF_URL}}
 
 echo "[STEP] Setting up build environment..."
 
+if ! find_host_cc ; then
+    exit 1
+fi
+declare -rx HOSTCC HOSTCXX
+
 # Create and enter build directory
 mkdir -p "${OUTPUT_DIR}"
 cd "${OUTPUT_DIR}"
 
 # Set environment variables, read-only and exported
-declare -rx ARCH="${TARGET_ARCH}"
-declare -rx CROSS_COMPILE="${PWD}/${TOOLCHAIN_DIR}/bin/${TOOLCHAIN_PREFIX}"
+declare -rx ARCH=arm64
+declare -rx CROSS_COMPILE="${PWD}/${TOOLCHAIN_DIR}/bin/aarch64-unknown-linux-musl-"
 
 echo "Build directory: ${PWD}"
 echo "Architecture: ${ARCH}"
+echo "Host compiler: ${HOSTCC}"
 echo "Cross compiler: ${CROSS_COMPILE}"
 
 # =============================================================================
@@ -528,14 +596,14 @@ if [[ ! -d "${TOOLCHAIN_DIR}" ]]; then
         if ! download "${TOOLCHAIN_URL}" "${TOOLCHAIN_ARCHIVE}" ; then
 	    echo "error: failed to download the ARM GNU toolchain (${TOOLCHAIN_ARCHIVE})"
 	    exit 1
-	fi
+        fi
     fi
 
     echo "Extracting ARM GNU toolchain..."
     tar -xf "${TOOLCHAIN_ARCHIVE}"
 
     # Verify toolchain
-    if [[ ! -x "${TOOLCHAIN_DIR}/bin/${TOOLCHAIN_PREFIX}gcc" ]]; then
+    if [[ ! -x "${TOOLCHAIN_DIR}/bin/aarch64-unknown-linux-musl-gcc" ]]; then
         echo "ERROR: ARM toolchain verification failed"
         exit 1
     fi
@@ -552,25 +620,21 @@ export PATH=${PWD}/${TOOLCHAIN_DIR}/bin:$PATH
 # BUILD ARM TRUSTED FIRMWARE
 # =============================================================================
 
-if [[ -n ${ATF_PLAT} ]]; then
-    echo "[STEP] Building ARM Trusted Firmware (ATF) for ${ATF_PLAT}..."
+echo "[STEP] Building ARM Trusted Firmware (ATF)..."
 
-    if [[ ! -d "${ATF_DIR}" ]]; then
-        clone_and_checkout "${ATF_REPO}" "${ATF_REF}" "${ATF_DIR}"
-    fi
-
-    cd "${ATF_DIR}"
-
-    # Clean and build ATF
-    make clean
-    make -j "${JOBS}" PLAT="${ATF_PLAT}" bl31 ENABLE_LTO=0
-
-    cd ..
-
-    echo "ATF build complete"
-else
-    echo "[STEP] ${PLATFORM_TITLE} does not use ARM Trusted Firmware; skipping ATF"
+if [[ ! -d "${ATF_DIR}" ]]; then
+    clone_and_checkout "${ATF_REPO}" "${ATF_REF}" "${ATF_DIR}"
 fi
+
+cd "${ATF_DIR}"
+
+# Clean and build ATF
+make HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" clean
+make -j "${JOBS}" HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" PLAT="${ATF_PLAT}" bl31 ENABLE_LTO=
+
+cd ..
+
+echo "ATF build complete"
 
 
 # =============================================================================
@@ -588,26 +652,20 @@ cd "${UBOOT_DIR}"
 # Enable debug info for compatibility
 sed -i 's/PLATFORM_CPPFLAGS += -D__ARM__/PLATFORM_CPPFLAGS += -D__ARM__ -gdwarf-4/g' arch/arm/config.mk
 
-# Configure for SD card boot. Boards without this property are left unchanged.
+# Configure for SD card boot
 sed -i 's/u-boot,spl-boot-order.*/u-boot,spl-boot-order = \&mmc;/g' "${UBOOT_DTSI}"
 
-# Disable NAND when the board dtsi enables it. Agilex nodes that only carry
-# bootph-all are left alone.
-sed -i '/&nand {/,/};/ s/status = "okay"/status = "disabled"/' "${UBOOT_DTSI}"
-
 # Build U-Boot
-make clean && make mrproper
-make "${UBOOT_DEFCONFIG}"
+make HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" clean && make HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" mrproper
+make HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" "${UBOOT_DEFCONFIG}"
 
 # Link directly to ATF bl31.bin in its build directory
-if [[ -n ${ATF_PLAT} ]]; then
-    ln -sf "../${ATF_DIR}/build/${ATF_PLAT}/release/bl31.bin" .
-fi
+ln -sf "../${ATF_DIR}/build/${ATF_PLAT}/release/bl31.bin" .
 
-make -j "${JOBS}"
+make -j "${JOBS}" HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}"
 
-# SPL image is needed when a JIC file is created. Copy it at a known location
-cp "${SPL_ARTIFACT}" ${OUTPUT_DIR_ABS} 
+# spl hex file is needed when JIC file is created. Copy it at a known location
+cp spl/u-boot-spl-dtb.hex ${OUTPUT_DIR_ABS} 
 
 cd ..
 
@@ -620,17 +678,27 @@ echo "[STEP] Getting uboot script ..."
 
 # get the updated uboot_script.its everytime
 rm -f "${UBOOT_ITS_FILE}"
+
+echo "downloading from ${UBOOT_ITS_URL}"
 if ! download "${UBOOT_ITS_URL}" "${UBOOT_ITS_FILE}" ; then
-	echo "error: failed to dowbload ${UBOOT_ITS_FILE}"
+	echo "error: failed to download ${UBOOT_ITS_FILE}"
 	exit 3
 fi
 
 # get the updated uboot.txt everytime
 rm -f "${UBOOT_SCRIPT_FILE}"
 if ! download "${UBOOT_SCRIPT_URL}" "${UBOOT_SCRIPT_FILE}" ; then
-	echo "error: failed to dowbload ${UBOOT_SCRIPT_FILE}"
+	echo "error: failed to download ${UBOOT_SCRIPT_FILE}"
 	exit 3
 fi
+
+# The script does bootm ${loadaddr}#board-${board_id}. Set a
+# default when the environment does not already have one.
+{
+       echo "if test -z \"\${board_id}\"; then setenv board_id ${BOARD_ID}; fi"
+       cat "${UBOOT_SCRIPT_FILE}"
+} > "${UBOOT_SCRIPT_FILE}.new"
+mv "${UBOOT_SCRIPT_FILE}.new" "${UBOOT_SCRIPT_FILE}"
 
 mkimage -f "${UBOOT_ITS_FILE}" boot.scr.uimg
 
@@ -644,7 +712,6 @@ echo "[STEP] Building Linux kernel..."
 
 rm -rf ${LINUX_LM_DIR} && mkdir ${LINUX_LM_DIR}
 _LINUX_LM_DIR_ABS="$(readlink -f ${LINUX_LM_DIR})"
-_LINUX_LM_TAR="${PWD}/linux-modules.tar"
 
 if [[ ! -d "${LINUX_DIR}" ]]; then
     clone_and_checkout "${LINUX_REPO}" "${LINUX_REF}" "${LINUX_DIR}"
@@ -653,27 +720,25 @@ fi
 cd "${LINUX_DIR}"
 
 # Create custom config fragment for networking
-cat > "config-fragment-${PLATFORM}" << 'EOF'
+cat > config-fragment-agilex5 << 'EOF'
 # Enable Ethernet connectivity
 CONFIG_MARVELL_PHY=y
 EOF
 
 # Configure and build kernel
-make defconfig
-./scripts/kconfig/merge_config.sh -O ./ ./.config "./config-fragment-${PLATFORM}"
-make oldconfig
-make -j "${JOBS}" Image && make "${LINUX_DTB}"
-make -j "${JOBS}" modules 
-make -j "${JOBS}" modules_install INSTALL_MOD_PATH="${_LINUX_LM_DIR_ABS}"
-set -x
-pwd
+make HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" defconfig
+./scripts/kconfig/merge_config.sh -m -O ./ ./.config ./config-fragment-agilex5
+make HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" olddefconfig
+make -j "${JOBS}" HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" Image && make HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" "${LINUX_DTB}"
+make -j "${JOBS}" HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" modules
+make -j "${JOBS}" HOSTCC="${HOSTCC}" HOSTCXX="${HOSTCXX}" modules_install INSTALL_MOD_PATH="${_LINUX_LM_DIR_ABS}"
+
 cd ${_LINUX_LM_DIR_ABS}
 # Debian merges /lib into /usr/lib. A tarball rooted at lib/ replaces that
 # symlink, which removes /lib/systemd. Place modules under usr/lib instead.
 mkdir -p usr
 rm -rf usr/lib
 mv lib usr/lib
-tar cf ${_LINUX_LM_TAR} usr/lib/modules
 
 cd ..
 
@@ -682,13 +747,7 @@ echo "Linux kernel build complete"
 # =============================================================================
 # CREATE KERNEL.ITS
 # =============================================================================
-KERNEL_IMAGE="${LINUX_DIR}/arch/${ARCH}/boot/Image"
-if [[ ${KERNEL_FIT_COMPRESSION} == lzma ]]; then
-    xz --threads=${JOBS} --format=lzma -f -k "${KERNEL_IMAGE}"
-    KERNEL_FIT_DATA="${KERNEL_IMAGE}.lzma"
-else
-    KERNEL_FIT_DATA="${KERNEL_IMAGE}"
-fi
+xz --threads=${JOBS} --format=lzma -f -k ${LINUX_DIR}/arch/arm64/boot/Image
 
 echo "[STEP] Creating kernel.its & kernel.itb"
 
@@ -709,15 +768,15 @@ cat > kernel_test.its <<EOF
 
             description = "Linux Kernel";
 
-            data = /incbin/("${KERNEL_FIT_DATA}");
+            data = /incbin/("${LINUX_DIR}/arch/arm64/boot/Image.lzma");
 
             type = "kernel";
 
-            arch = "${KERNEL_FIT_ARCH}";
+            arch = "arm64";
 
             os = "linux";
 
-            compression = "${KERNEL_FIT_COMPRESSION}";
+            compression = "lzma";
 
             load = <${KERNEL_LOAD}>;
 
@@ -731,7 +790,7 @@ cat > kernel_test.its <<EOF
 
             description = "${LINUX_DTB_NAME%.dtb}";
 
-            data = /incbin/("${LINUX_DIR}/arch/${ARCH}/boot/dts/${LINUX_DTB}");
+            data = /incbin/("${LINUX_DIR}/arch/arm64/boot/dts/${LINUX_DTB}");
 
             type = "flat_dt";
 
@@ -744,7 +803,7 @@ cat > kernel_test.its <<EOF
         };
 EOF
 
-if [ ! -z ${FABRIC_RBF_FILE} -a ! -z ${FABRIC_RBF_URL} ] ; then
+if [[ -n "${FABRIC_RBF_FILE}" && -n "${FABRIC_RBF_URL}" ]]; then
     if [ ! -e "${FABRIC_RBF_FILE}" ] ; then
         download "${FABRIC_RBF_URL}" "${FABRIC_RBF_FILE}"
     else
@@ -759,7 +818,7 @@ if [ ! -z ${FABRIC_RBF_FILE} -a ! -z ${FABRIC_RBF_URL} ] ; then
 
 	    data = /incbin/("${FABRIC_RBF_FILE}");
 
-            type = "flat_dt";
+            type = "fpga";
 
             arch = "arm64";
 
@@ -776,15 +835,25 @@ cat >> kernel_test.its <<EOF
 
     configurations {
 
-        default = "board-0";
+        default = "board-${BOARD_ID}";
 
-        board-0 {
+        board-${BOARD_ID} {
 
-            description = "board_0";
+            description = "board_${BOARD_ID}";
 
             kernel = "kernel";
 
             fdt = "fdt-0";
+EOF
+
+if [[ -n "${FABRIC_RBF_FILE}" && -n "${FABRIC_RBF_URL}" ]]; then
+    cat >> kernel_test.its <<EOF
+
+            fpga = "fpga-0";
+EOF
+fi
+
+cat >> kernel_test.its <<EOF
 
             hash-1 { algo = "crc32"; };
 
@@ -817,11 +886,9 @@ else
     echo "Debian archive previously downloaded"
 fi
 
-# The arm64 cloud image contains disk.raw. The armhf download is a root
-# filesystem tarball and is unpacked straight onto the SD card.
-if [[ ${DEBIAN_ROOTFS_KIND} == disk ]]; then
-    tar xfJ "${DEBIAN_ARCHIVE}"
-fi
+# the archive contains the file 'disk.raw' that we'll use
+# to extract the root file system
+tar xfJ "${DEBIAN_ARCHIVE}"
 
 echo "Debian download complete"
 
@@ -831,115 +898,156 @@ echo "Debian download complete"
 #
 echo "[STEP] Creating SD card image..."
 
-if ! write_root_shadow ; then
+if ! command -v debugfs >/dev/null 2>&1 ; then
+    echo "error: debugfs not found (install e2fsprogs)" >&2
     exit 1
 fi
 
-# Running guestfish requires access to /boot/vmlinuz-* (chmod a+r)
-# Being part of the kvm group may help with speed execution
-if [[ ${DEBIAN_ROOTFS_KIND} == disk ]]; then
-    guestfish --ro -a disk.raw <<EOF
-sparse ${SDIMG} ${SDCARD_IMG_SIZE}
-run
-part-init /dev/sdb mbr
-part-add /dev/sdb p ${BOOT_PART_SECTOR_START} ${BOOT_PART_SECTOR_END}
-part-add /dev/sdb p ${RFS_PART_SECTOR_START}  ${RFS_PART_SECTOR_END}
-mkfs fat /dev/sdb1
-mount /dev/sdb1 /
-copy-in ${PWD}/${UBOOT_DIR}/${UBOOT_BIN} /
-copy-in ${PWD}/kernel.itb /
-copy-in ${PWD}/boot.scr.uimg /
-unmount /
-copy-device-to-device /dev/sda1 /dev/sdb2
-mount /dev/sdb2 /
-upload ${_DEBIAN_SHADOW_FILE} /etc/shadow
-chmod 0640 /etc/shadow
-upload ${_DEBIAN_FSTAB_FILE} /etc/fstab
-tar-in ${_LINUX_LM_TAR} /
-ln-sf sbin/init /init
-sync
-EOF
-else
-    # The armhf tarball is the only disk guestfish adds, so it is /dev/sda.
-    guestfish <<EOF
-sparse ${SDIMG} ${SDCARD_IMG_SIZE}
-run
-part-init /dev/sda mbr
-part-add /dev/sda p ${BOOT_PART_SECTOR_START} ${BOOT_PART_SECTOR_END}
-part-add /dev/sda p ${RFS_PART_SECTOR_START}  ${RFS_PART_SECTOR_END}
-mkfs fat /dev/sda1
-mkfs ext4 /dev/sda2
-mount /dev/sda1 /
-copy-in ${PWD}/${UBOOT_DIR}/${UBOOT_BIN} /
-copy-in ${PWD}/kernel.itb /
-copy-in ${PWD}/boot.scr.uimg /
-unmount /
-mount /dev/sda2 /
-tar-in ${PWD}/${DEBIAN_ARCHIVE} / compress:xz
-ln-s /usr/lib/systemd/system/serial-getty@.service /etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service
-upload ${_DEBIAN_SHADOW_FILE} /etc/shadow
-chmod 0640 /etc/shadow
-upload ${_DEBIAN_FSTAB_FILE} /etc/fstab
-tar-in ${_LINUX_LM_TAR} /
-ln-sf sbin/init /init
-sync
-EOF
+if ! create_root_shadow ; then
+    exit 1
 fi
 
-if [[ $? -eq 0 ]]; then
-    echo "SUCCESS: SD card image created: ${SDIMG}"
-    echo ""
-    echo "======================================================================"
-    echo "                           BUILD COMPLETE"
-    echo "======================================================================"
-    echo ""
-    echo "Output files created in: ${PWD}"
-    echo ""
-    echo "Key files:"
-    echo "  ${SDIMG}                   - SD card image (write to SD card)"
-    echo "  ${UBOOT_BIN}                   - U-Boot bootloader"
-    echo "  Image                        - Linux kernel"
-    echo "  ${LINUX_DTB_NAME}    - Device tree"
-    echo "  ${DEBIAN_ARCHIVE}            - Debian root filesystem (downloaded)"
-    echo ""
-    echo "To write SD card image (:"
-    echo "  sudo dd if=${PWD}/${SDIMG} of=/dev/sdX bs=1M"
-    echo "  (Replace /dev/sdX with your SD card device)"
-    echo ""
-    echo "To boot from SD card:"
-    echo "  1. Write image to SD card"
-    echo "  2. Insert SD card into the ${PLATFORM_TITLE} board"
-    echo "  3. Use quartus_pfg to generate a JIC using GHRD sof + ${SPL_ARTIFACT_NAME}"
-    if [[ -n ${QUARTUS_FLASH_LOADER} ]]; then
-        echo "     e.g. quartus_pfg \\"
-        echo "          -c sof_filename.sof output_file.jic \\"
-        echo "          -o device=${QUARTUS_DEVICE} \\"
-        echo "          -o flash_loader=${QUARTUS_FLASH_LOADER} \\"
-        echo "          -o hps_path=${OUTPUT_DIR_ABS}/${SPL_ARTIFACT_NAME} \\"
-        echo "          -o mode=${QUARTUS_MODE} \\"
-        echo "          -o hps=1"
-    else
-        echo "     Set device, flash_loader, and mode for the ${PLATFORM_TITLE} board."
-        echo "     e.g. quartus_pfg \\"
-        echo "          -c sof_filename.sof output_file.jic \\"
-        echo "          -o hps_path=${OUTPUT_DIR_ABS}/${SPL_ARTIFACT_NAME} \\"
-        echo "          -o hps=1"
+BOOT_IMG="boot.vfat"
+RFS_IMG="rootfs.ext4"
+RFS_CMDS="rootfs.debugfs"
+
+echo "Assembling ${SDIMG} from ${IMAGE_CFG}"
+
+rm -f "${SDIMG}"
+truncate -s ${SDCARD_IMG_SIZE} "${SDIMG}"
+write_dos_mbr "${SDIMG}" \
+    "${BOOT_PART_SECTOR_START}" "${BOOT_PART_SECTORS}" 0x0c 1 \
+    "${RFS_PART_SECTOR_START}" "${RFS_PART_SECTORS}" 0x83 0
+
+# 64M FAT, files from agilex5_image.cfg plus kernel.itb and boot.scr.uimg
+# for the debian FIT boot script.
+rm -f "${BOOT_IMG}"
+truncate -s ${BOOT_PART_SIZE} "${BOOT_IMG}"
+MTOOLS_SKIP_CHECK=1 mformat -C -i "${BOOT_IMG}" \
+    -T ${BOOT_PART_SECTORS} -h ${FAT_BPB_HEADS} -s ${FAT_BPB_SPT} \
+    -H ${BOOT_PART_SECTOR_START} ::
+MTOOLS_SKIP_CHECK=1 mcopy -i "${BOOT_IMG}" \
+    "${LINUX_DIR}/arch/arm64/boot/Image" \
+    "${LINUX_DIR}/arch/arm64/boot/dts/${LINUX_DTB}" \
+    "${UBOOT_DIR}/u-boot.itb" \
+    kernel.itb boot.scr.uimg ::/
+
+dd if="${BOOT_IMG}" of="${SDIMG}" bs=512 seek=${BOOT_PART_SECTOR_START} \
+   conv=notrunc status=none
+rm -f "${BOOT_IMG}"
+
+if ! read -r rfs_start rfs_sectors < <(debian_root_partition disk.raw) ||
+   [[ -z ${rfs_start} || -z ${rfs_sectors} ]]; then
+    echo "error: could not find an ext4 root filesystem in disk.raw" >&2
+    exit 1
+fi
+if [[ ${rfs_sectors} -gt ${RFS_PART_SECTORS} ]]; then
+    echo "error: the Debian root file system does not fit in the SD card partition" >&2
+    exit 1
+fi
+echo "Debian ext4 at sector ${rfs_start}, ${rfs_sectors} sectors"
+rm -f "${RFS_IMG}"
+dd if=disk.raw of="${RFS_IMG}" bs=4M iflag=skip_bytes,count_bytes \
+   skip=$(( ${rfs_start} * 512 )) count=$(( ${rfs_sectors} * 512 )) status=none
+if ! ext4_has_magic "${RFS_IMG}" ; then
+    echo "error: extracted Debian image is not ext4" >&2
+    exit 1
+fi
+# Grow the filesystem to the MMC partition size when host e2fsprogs can.
+truncate -s ${RFS_PART_SIZE} "${RFS_IMG}"
+e2fsck_rootfs "${RFS_IMG}" || true
+if command -v resize2fs >/dev/null 2>&1 && resize2fs "${RFS_IMG}" >/dev/null 2>&1 ; then
+    :
+else
+    echo "warning: could not resize the Debian ext4 image to the MMC partition; systemd-growfs will finish this on first boot" >&2
+fi
+
+shadow_gid=$(debugfs -R "stat /etc/shadow" "${RFS_IMG}" 2>/dev/null | sed -n 's/.*Group: *\([0-9]*\).*/\1/p')
+
+{
+    echo "rm /etc/shadow"
+    echo "write \"${_DEBIAN_SHADOW_FILE}\" /etc/shadow"
+    echo "sif /etc/shadow mode 0100640"
+    echo "sif /etc/shadow gid ${shadow_gid:-0}"
+    echo "rm /etc/fstab"
+    echo "write \"${_DEBIAN_FSTAB_FILE}\" /etc/fstab"
+    echo "sif /etc/fstab mode 0100644"
+    rootfs_tree_cmds "${_LINUX_LM_DIR_ABS}/usr/lib/modules" /usr/lib/modules
+    if rootfs_has "${RFS_IMG}" /init ; then
+        echo "rm /init"
     fi
-    echo "  4. Program the JIC and power cycle the board"
-    echo "     e.g. quartus_pgm -c 1 -m jtag -o \"pvi;output_file.jic\""
-    echo ""
-    echo "To Login, user name is ${DEBIAN_USER} and the password is ${DEBIAN_PASS}"
-    echo ""
-    echo "IMPORTANT:"
-    echo " Once you have logged on to Debian on ${PLATFORM_TITLE}, please check the date"
-    echo " are set correctly by NTP"
-    echo "    timedatectl show"
-    echo " If NTPSynchronized=no appears, NTP is not functional, which may be"
-    echo " due to a firewall issue"
-    echo " You may have to set the date manually, such as:"
-    echo "    date -s '2026-06-22 12:00:00'"
-    echo ""
-else
-    echo "ERROR: Failed to create SD card image"
+    echo "symlink /init sbin/init"
+} > "${RFS_CMDS}"
+
+RFS_LOG="${RFS_CMDS}.log"
+if ! debugfs -w -f "${RFS_CMDS}" "${RFS_IMG}" >"${RFS_LOG}" 2>&1 ||
+   grep -Eq '^(mkdir|write|symlink|rm|sif):' "${RFS_LOG}" ; then
+    cat "${RFS_LOG}" >&2
+    echo "ERROR: Failed to update the root file system" >&2
     exit 1
 fi
+rm -f "${RFS_LOG}"
+
+if ! e2fsck_rootfs "${RFS_IMG}" ; then
+    exit 1
+fi
+
+for path in /etc/shadow /etc/fstab /usr/lib/modules /init ; do
+    if ! rootfs_has "${RFS_IMG}" "${path}" ; then
+        echo "ERROR: Failed to update the root file system: missing ${path}" >&2
+        exit 1
+    fi
+done
+
+dd if="${RFS_IMG}" of="${SDIMG}" bs=4M oflag=seek_bytes \
+   seek=$(( ${RFS_PART_SECTOR_START} * 512 )) conv=notrunc status=none
+
+if ! ext4_has_magic "${SDIMG}" $(( ${RFS_PART_SECTOR_START} * 512 )) ; then
+    echo "error: MMC partition 2 does not contain an ext4 filesystem" >&2
+    exit 1
+fi
+rm -f "${RFS_IMG}" "${RFS_CMDS}"
+
+cat <<EOS
+
+======================================================================
+                           BUILD COMPLETE
+======================================================================
+
+SD card image:  ${PWD}/${SDIMG}
+
+Build outputs (in ${PWD}):
+  ${SDIMG}
+      SD card image
+  ${UBOOT_DIR}/u-boot.itb
+      U-Boot bootloader
+  kernel.itb
+      Linux kernel and device tree (FIT image)
+  boot.scr.uimg
+      U-Boot boot script
+  u-boot-spl-dtb.hex
+      SPL image used to build the JIC
+  ${DEBIAN_ARCHIVE}
+      Debian root filesystem (downloaded)
+
+Write the SD card image (replace /dev/sdX with your SD card device):
+  sudo dd if=${PWD}/${SDIMG} of=/dev/sdX bs=1M status=progress conv=fsync
+
+Boot from the SD card:
+  1. Write the image to the SD card.
+  2. Insert the SD card into the Agilex 5 board.
+  3. Generate a JIC from the GHRD .sof and u-boot-spl-dtb.hex:
+       quartus_pfg -c sof_filename.sof output_file.jic \\
+           -o device=MT25QU128 \\
+           -o flash_loader=A5ED065BB32AE6SR0 \\
+           -o hps_path=${OUTPUT_DIR_ABS}/u-boot-spl-dtb.hex \\
+           -o mode=ASX4 \\
+           -o hps=1
+  4. Program the JIC and power cycle the board:
+       quartus_pgm -c 1 -m jtag -o "pvi;output_file.jic"
+
+Login:
+  user:     ${DEBIAN_USER}
+  password: ${DEBIAN_PASS}
+
+EOS
