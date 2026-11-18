@@ -100,24 +100,25 @@ declare -r SZ_GB=$((${SZ_MB}*${SZ_KB}))
 
 # sizes in bytes
 declare -r SDIMG="sdcard_agilex5.img"
-declare -r SDCARD_IMG_SIZE=$((4*SZ_GB))
-declare -r RFS_PART_SIZE=$((3*${SZ_GB}))
+declare -r SDCARD_IMG_SIZE=$((2*SZ_GB))
 # agilex5_image.cfg: image boot.vfat { size = 64M }
 declare -r BOOT_PART_SIZE=$((64*${SZ_MB}))
+# Layout from agilex5_image.cfg. genimage's empty hdimage aligns to 1MiB
+# (sector 2048). Type 0xc bootable FAT, type 0x83 rootfs.
+declare -r BOOT_PART_SECTOR_START=2048
+# Rootfs fills the remainder of the image after the boot partition.
+declare -r RFS_PART_SIZE=$(( SDCARD_IMG_SIZE - BOOT_PART_SECTOR_START * 512 - BOOT_PART_SIZE ))
 declare -r IMAGE_CFG="agilex5_image.cfg"
 
 # =============================================================================
 # HELPERS AND FUNCTIONS
 # =============================================================================
 
-# Layout from agilex5_image.cfg. genimage's empty hdimage aligns to 1MiB
-# (sector 2048). Type 0xc bootable FAT, type 0x83 rootfs.
-declare -r BOOT_PART_SECTOR_START=2048
 declare -r BOOT_PART_SECTORS=$(( ${BOOT_PART_SIZE} / 512 ))
 declare -r RFS_PART_SECTOR_START=$(( ${BOOT_PART_SECTOR_START} + ${BOOT_PART_SECTORS} ))
 declare -r RFS_PART_SECTORS=$(( ${RFS_PART_SIZE} / 512 ))
-# FAT BPB geometry guestfish wrote for a 4G image; SPL's fat_set_blk_dev
-# rejected default 16/32 heads/spt.
+# FAT BPB geometry guestfish wrote for a known-good Agilex SD image; SPL's
+# fat_set_blk_dev rejected default 16/32 heads/spt.
 declare -r FAT_BPB_HEADS=133
 declare -r FAT_BPB_SPT=62
 
@@ -272,6 +273,81 @@ off = int(sys.argv[2], 0)
 with open(path, "rb") as f:
     f.seek(off + 0x438)
     sys.exit(0 if f.read(2) == b"\x53\xef" else 1)
+PY
+}
+
+# ext4_clear_orphan_file <ext4 image>: clear Debian 13's orphan_file compat
+# feature (FEATURE_C12) on every backup superblock so host e2fsprogs 1.46.x
+# can e2fsck/resize2fs the image. Updates superblock checksums in place.
+function ext4_clear_orphan_file() {
+
+    python3 - "${1}" <<'PY'
+import struct
+import sys
+
+ORPHAN_FILE = 0x1000  # EXT4_FEATURE_COMPAT_ORPHAN_FILE
+path = sys.argv[1]
+
+def crc32c_table():
+    poly = 0x82F63B78
+    table = []
+    for i in range(256):
+        crc = i
+        for _ in range(8):
+            crc = (crc >> 1) ^ poly if crc & 1 else crc >> 1
+        table.append(crc)
+    return table
+
+CRC32C_T = crc32c_table()
+
+def crc32c_le(crc, data):
+    for b in data:
+        crc = CRC32C_T[(crc ^ b) & 0xFF] ^ (crc >> 8)
+    return crc
+
+def sb_crc(sb):
+    return crc32c_le(0xFFFFFFFF, bytes(sb[:0x3FC]))
+
+def is_backup_group(g, groups):
+    if g in (0, 1):
+        return True
+    for p in (3, 5, 7):
+        x = p
+        while x < groups:
+            if x == g:
+                return True
+            if x > g:
+                break
+            x *= p
+    return False
+
+with open(path, "r+b") as f:
+    f.seek(1024)
+    sb = bytearray(f.read(1024))
+    if struct.unpack_from("<H", sb, 0x38)[0] != 0xEF53:
+        sys.exit("ext4_clear_orphan_file: no ext4 superblock")
+    log_bs = struct.unpack_from("<I", sb, 0x18)[0]
+    bs = 1024 << log_bs
+    blocks = struct.unpack_from("<I", sb, 0x04)[0]
+    blocks |= struct.unpack_from("<I", sb, 0x150)[0] << 32
+    bpg = struct.unpack_from("<I", sb, 0x20)[0]
+    groups = (blocks + bpg - 1) // bpg
+    for g in range(groups):
+        if not is_backup_group(g, groups):
+            continue
+        off = 1024 if g == 0 else g * bpg * bs
+        f.seek(off)
+        sb = bytearray(f.read(1024))
+        if struct.unpack_from("<H", sb, 0x38)[0] != 0xEF53:
+            continue
+        compat = struct.unpack_from("<I", sb, 0x5C)[0]
+        if not (compat & ORPHAN_FILE):
+            continue
+        struct.pack_into("<I", sb, 0x5C, compat & ~ORPHAN_FILE)
+        struct.pack_into("<I", sb, 0x3FC, sb_crc(sb))
+        f.seek(off)
+        f.write(sb)
+sys.exit(0)
 PY
 }
 
@@ -936,10 +1012,6 @@ if ! read -r rfs_start rfs_sectors < <(debian_root_partition disk.raw) ||
     echo "error: could not find an ext4 root filesystem in disk.raw" >&2
     exit 1
 fi
-if [[ ${rfs_sectors} -gt ${RFS_PART_SECTORS} ]]; then
-    echo "error: the Debian root file system does not fit in the SD card partition" >&2
-    exit 1
-fi
 echo "Debian ext4 at sector ${rfs_start}, ${rfs_sectors} sectors"
 rm -f "${RFS_IMG}"
 dd if=disk.raw of="${RFS_IMG}" bs=4M iflag=skip_bytes,count_bytes \
@@ -948,12 +1020,24 @@ if ! ext4_has_magic "${RFS_IMG}" ; then
     echo "error: extracted Debian image is not ext4" >&2
     exit 1
 fi
-# Grow the filesystem to the MMC partition size when host e2fsprogs can.
-truncate -s ${RFS_PART_SIZE} "${RFS_IMG}"
+# Fit the filesystem to the MMC partition size when host e2fsprogs can.
+# Debian 13 sets orphan_file (FEATURE_C12); clear it so 1.46.x resize2fs works.
+ext4_clear_orphan_file "${RFS_IMG}"
 e2fsck_rootfs "${RFS_IMG}" || true
-if command -v resize2fs >/dev/null 2>&1 && resize2fs "${RFS_IMG}" >/dev/null 2>&1 ; then
-    :
+if [[ $(stat -c%s "${RFS_IMG}") -gt ${RFS_PART_SIZE} ]]; then
+    if ! command -v resize2fs >/dev/null 2>&1 ||
+       ! resize2fs "${RFS_IMG}" $(( ${RFS_PART_SIZE} / 1024 ))K >/dev/null 2>&1 ; then
+        echo "error: the Debian root file system does not fit in the SD card partition" >&2
+        exit 1
+    fi
+    truncate -s ${RFS_PART_SIZE} "${RFS_IMG}"
+elif command -v resize2fs >/dev/null 2>&1 ; then
+    truncate -s ${RFS_PART_SIZE} "${RFS_IMG}"
+    if ! resize2fs "${RFS_IMG}" >/dev/null 2>&1 ; then
+        echo "warning: could not resize the Debian ext4 image to the MMC partition; systemd-growfs will finish this on first boot" >&2
+    fi
 else
+    truncate -s ${RFS_PART_SIZE} "${RFS_IMG}"
     echo "warning: could not resize the Debian ext4 image to the MMC partition; systemd-growfs will finish this on first boot" >&2
 fi
 
