@@ -17,9 +17,8 @@
 # The SD card image is assembled from regular files, so no root
 # privileges are needed to run this script. Only python3, mtools and
 # e2fsprogs are required. Partition 1 is FAT16 with the BPB guestfish
-# produced (spt 62, heads 133, hidden sectors = partition start) and the
-# MBR carries the parted bootstrap. SPL rejected a FAT with mkfs.vfat's
-# default geometry (fat register err -1).
+# produced (spt 62, heads 133, hidden sectors = partition start). SPL
+# rejected a FAT with mkfs.vfat's default geometry (fat register err -1).
 #
 # =============================================================================
 
@@ -328,9 +327,9 @@ function rootfs_tree_cmds() {
     done
 }
 
-# Write a DOS MBR: the 440-byte bootstrap used by guestfish/parted, a
-# disk signature, and up to four partitions. Each partition is
-# start,size,type,bootable (type may be 0xNN).
+# Write a DOS MBR: a zeroed 440-byte bootstrap area, a disk signature,
+# and up to four partitions. Each partition is start,size,type,bootable
+# (type may be 0xNN).
 function write_dos_mbr() {
 
     python3 - "$@" <<'PY'
@@ -338,12 +337,8 @@ import os
 import struct
 import sys
 
-# Guestfish/parted bootstrap; keep this matching known-good Agilex SD images.
-BOOTSTRAP = bytes.fromhex(
-    "fab800108ed0bc00b0b800008ed88ec0fbbe007cbf0006b90002f3a4ea21060000"
-    "bebe073804750b83c61081fefe0775f3eb16b402b001bb007cb2808a74018b4c02"
-    "cd13ea007c0000ebfe"
-).ljust(440, b"\x00")
+# Unused on Agilex (SPL/U-Boot do not run x86 MBR code).
+BOOTSTRAP = bytes(440)
 
 # 255 heads, 63 spt. Overflow CHS matches parted (fe c2 ff).
 HEADS = 255
