@@ -338,7 +338,7 @@ import os
 import struct
 import sys
 
-# Guestfish/parted bootstrap; images that boot on this SPL have it.
+# Guestfish/parted bootstrap; keep this matching known-good Agilex SD images.
 BOOTSTRAP = bytes.fromhex(
     "fab800108ed0bc00b0b800008ed88ec0fbbe007cbf0006b90002f3a4ea21060000"
     "bebe073804750b83c61081fefe0775f3eb16b402b001bb007cb2808a74018b4c02"

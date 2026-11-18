@@ -9,10 +9,10 @@
 # if you can't clone to the above repo, then these will work
 ATF_REPO="https://github.com/altera-fpga/arm-trusted-firmware.git"
 ATF_REF="socfpga_v2.14.1"
-UBOOT_REPO="https://github.com/altera-fpga/u-boot-socfpga.git"
-UBOOT_REF="socfpga_v2026.04"
-LINUX_REPO="https://github.com/altera-fpga/linux-socfpga.git"
-LINUX_REF="socfpga-6.18.20-lts"
+UBOOT_REPO="https://dinguyen702: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@github.com/altera-innersource/applications.fpga.soc.uboot-socfpga.git"
+UBOOT_REF="socfpga_v2026.10"
+LINUX_REPO="https://dinguyen702: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@github.com/altera-innersource/applications.fpga.soc.linux-socfpga-dev.git"
+LINUX_REF="socfpga-6.18.53-lts"
 
 # optional
 UBOOT_ITS_FILE="uboot_script.its"
@@ -23,5 +23,5 @@ UBOOT_SCRIPT_URL="https://raw.githubusercontent.com/altera-fpga/meta-altera-fpga
 FABRIC_RBF_FILE=
 FABRIC_RBF_URL=
 
-# FIT config board-${BOARD_ID}; used by the U-Boot script if unset in env
-BOARD_ID=0
+# FIT config board-${BOARD_ID}; must match U-Boot's board_id (this board reports 4)
+BOARD_ID=4
